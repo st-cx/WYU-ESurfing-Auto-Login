@@ -35,6 +35,10 @@ $Config = [ordered]@{
     adapter_name            = '以太网'
     login_btn_x             = 267
     login_btn_y             = 533
+    # 校准基线: login_btn_x/y 所对应的客户端窗口尺寸 (默认对应 533x914 标准窗口)
+    # 更换电脑/高DPI缩放时自动按窗口尺寸换算; 也可用 tools\calibrate.ps1 引导重新校准
+    calib_win_w             = 533
+    calib_win_h             = 914
     check_interval_sec      = 20
     fail_threshold          = 2
     probe_timeout_ms        = 2000
@@ -79,6 +83,10 @@ $ProbeTargets       = $Config.probe_targets
 # 实测登录页按钮在 y=533; 注意已连接页面的"断 开"按钮在 y=610, 两者布局不同)
 $LoginBtnOffsetX = [int]$Config.login_btn_x
 $LoginBtnOffsetY = [int]$Config.login_btn_y
+$CalibWinW       = [int]$Config.calib_win_w
+$CalibWinH       = [int]$Config.calib_win_h
+if ($CalibWinW -lt 100) { $CalibWinW = 533 }
+if ($CalibWinH -lt 100) { $CalibWinH = 914 }
 
 # ----------------------------
 
@@ -96,6 +104,8 @@ if (-not ([System.Management.Automation.PSTypeName]'CampusWatch.Win32').Type) {
 [System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool PostMessage(System.IntPtr hWnd, uint Msg, System.IntPtr wParam, System.IntPtr lParam);
 [System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc lpEnumFunc, System.IntPtr lParam);
 [System.Runtime.InteropServices.DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(System.IntPtr hWnd, out uint lpdwProcessId);
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern System.IntPtr GetWindowDpiAwarenessContext(System.IntPtr hWnd);
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern int GetAwarenessFromDpiAwarenessContext(System.IntPtr value);
 public delegate bool EnumProc(System.IntPtr hWnd, System.IntPtr lParam);
 public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
 "@
@@ -195,6 +205,46 @@ function Save-WindowShot {
     } catch {}
 }
 
+function Get-WindowAwareness {
+    # 0=DPI不感知 1=系统感知 2=每显示器感知 -1=查询失败
+    param([IntPtr]$h)
+    try {
+        $ctx = [CampusWatch.Win32]::GetWindowDpiAwarenessContext($h)
+        if ($ctx -eq [IntPtr]::Zero) { return -1 }
+        return [CampusWatch.Win32]::GetAwarenessFromDpiAwarenessContext($ctx)
+    } catch { return -1 }
+}
+
+function Get-ClickPoints {
+    # 把配置里的按钮坐标换算成:
+    #   lpX/lpY   -> 供 PostMessage 使用的客户端坐标
+    #   physX/physY -> 相对窗口左上角的物理像素偏移 (真实点击用)
+    # 换算依据: 客户端窗口尺寸 + 客户端 DPI 感知方式, 使同一份配置适配
+    # 不同电脑的分辨率/缩放比例(125%/150%)/窗口尺寸
+    param([IntPtr]$h)
+    $rect = Get-WindowRectSafe $h
+    $physW = $rect.Right - $rect.Left
+    $physH = $rect.Bottom - $rect.Top
+    if (($rect.Left -le -30000) -or ($physW -lt 200) -or ($physH -lt 200)) {
+        # 最小化状态: 页面视口不变, 直接使用配置坐标
+        return @{ lpX = $LoginBtnOffsetX; lpY = $LoginBtnOffsetY;
+                  physX = $LoginBtnOffsetX; physY = $LoginBtnOffsetY }
+    }
+    $aware = Get-WindowAwareness $h
+    if ($aware -eq 0) {
+        # DPI 不感知的客户端: 其自身坐标空间恒为校准基线大小
+        $logicalW = $CalibWinW; $logicalH = $CalibWinH
+    } else {
+        # 系统/每显示器感知: 自身坐标空间 = 物理尺寸 (会随缩放变化)
+        $logicalW = $physW; $logicalH = $physH
+    }
+    $lpX = [int][Math]::Round($LoginBtnOffsetX * $logicalW / $CalibWinW)
+    $lpY = [int][Math]::Round($LoginBtnOffsetY * $logicalH / $CalibWinH)
+    $physX = [int][Math]::Round($lpX * $physW / $logicalW)
+    $physY = [int][Math]::Round($lpY * $physH / $logicalH)
+    return @{ lpX = $lpX; lpY = $lpY; physX = $physX; physY = $physY }
+}
+
 function Send-ClickToWindow {
     # 后台消息点击: 不移动真实鼠标, 锁屏状态下同样有效
     param([IntPtr]$h, [int]$x, [int]$y)
@@ -207,11 +257,12 @@ function Send-ClickToWindow {
 }
 
 function Send-RealClick {
-    param([IntPtr]$h, [int]$x, [int]$y)
+    param([IntPtr]$h)
     $rect = Restore-ClientWindow $h
     if (-not $rect) { Log '客户端窗口无法恢复到前台'; return $false }
     Save-WindowShot $h 'pre-click'
-    $sx = $rect.Left + $x; $sy = $rect.Top + $y
+    $p = Get-ClickPoints $h
+    $sx = $rect.Left + $p.physX; $sy = $rect.Top + $p.physY
     [CampusWatch.Win32]::SetCursorPos($sx, $sy) | Out-Null
     Start-Sleep -Milliseconds 200
     [CampusWatch.Win32]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero)   # LEFTDOWN
@@ -228,8 +279,9 @@ function Invoke-LoginClick {
 
     # 1) 后台点击 (不打扰用户)
     Save-WindowShot $h 'pre-bgclick'
-    Send-ClickToWindow $h $LoginBtnOffsetX $LoginBtnOffsetY
-    Log ('已发送后台点击 (' + $LoginBtnOffsetX + ',' + $LoginBtnOffsetY + ')')
+    $p = Get-ClickPoints $h
+    Send-ClickToWindow $h $p.lpX $p.lpY
+    Log ('已发送后台点击 (客户端坐标 ' + $p.lpX + ',' + $p.lpY + ')')
     Start-Sleep -Seconds 6
     if (Test-Internet) {
         Log '后台点击已生效, 网络恢复'
@@ -239,7 +291,7 @@ function Invoke-LoginClick {
 
     # 2) 前台真实点击
     Log '后台点击未生效, 改用前台真实点击'
-    return (Send-RealClick $h $LoginBtnOffsetX $LoginBtnOffsetY)
+    return (Send-RealClick $h)
 }
 
 function Wait-AuthSettle {
@@ -332,7 +384,8 @@ function Invoke-CommandFile {
             $h = Find-ClientWebWindow
             if ($h -ne [IntPtr]::Zero) {
                 Save-WindowShot $h 'pre-manualclick'
-                $cx = $LoginBtnOffsetX; $cy = $LoginBtnOffsetY
+                $p = Get-ClickPoints $h
+                $cx = $p.lpX; $cy = $p.lpY
                 if ($cmd -match 'click\s+(\d+)\s+(\d+)') { $cx = [int]$Matches[1]; $cy = [int]$Matches[2] }
                 Send-ClickToWindow $h $cx $cy
                 Log ('命令click: 已发送后台点击 (' + $cx + ',' + $cy + ')')
@@ -366,6 +419,15 @@ if ($Check) {
     Write-Output ('客户端: ' + [bool](Get-Process -Name $ClientProc -ErrorAction SilentlyContinue) +
                   '  窗口: ' + (Find-ClientWebWindow))
     Write-Output ('客户端目录: ' + $ClientDir + ' (存在=' + (Test-Path $ClientExe) + ')')
+    $h = Find-ClientWebWindow
+    if ($h -ne [IntPtr]::Zero) {
+        $rect = Get-WindowRectSafe $h
+        $p = Get-ClickPoints $h
+        Write-Output ('点击坐标: 配置(' + $LoginBtnOffsetX + ',' + $LoginBtnOffsetY + ') 基线(' +
+                      $CalibWinW + 'x' + $CalibWinH + ') 窗口(' + ($rect.Right - $rect.Left) + 'x' +
+                      ($rect.Bottom - $rect.Top) + ') 感知=' + (Get-WindowAwareness $h) +
+                      ' -> 客户端坐标(' + $p.lpX + ',' + $p.lpY + ')')
+    }
     exit 0
 }
 

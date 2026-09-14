@@ -185,6 +185,18 @@ New-Item -ItemType Directory -Path (Join-Path $installDir 'tools') -Force | Out-
 Copy-Item (Join-Path $Here 'watchdog.ps1') $installDir -Force
 $probe = Join-Path $Here 'tools\uia-probe.ps1'
 if (Test-Path $probe) { Copy-Item $probe (Join-Path $installDir 'tools') -Force }
+$calib = Join-Path $Here 'tools\calibrate.ps1'
+if (Test-Path $calib) { Copy-Item $calib (Join-Path $installDir 'tools') -Force }
+
+# 生成"校准按钮坐标.bat"到安装目录 (方便日后重新校准, 不依赖安装包)
+$calibBat = @"
+@echo off
+chcp 65001 >nul
+title 天翼校园自动登录工具 - 校准按钮坐标
+cd /d "%~dp0"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\calibrate.ps1"
+"@
+[IO.File]::WriteAllText((Join-Path $installDir '校准按钮坐标.bat'), $calibBat, (New-Object Text.UTF8Encoding($false)))
 
 # 生成 config.json (保留用户已调过的其它项)
 $cfgPath = Join-Path $installDir 'config.json'
