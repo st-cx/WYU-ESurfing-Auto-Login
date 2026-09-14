@@ -13,7 +13,8 @@
 
 param(
     [switch]$DryRun,      # 只探测并打印结果, 不安装
-    [switch]$Uninstall    # 卸载
+    [switch]$Uninstall,   # 卸载
+    [switch]$NoCalibrate  # 安装后不提示校准 (无人值守场景)
 )
 
 $ErrorActionPreference = 'Stop'
@@ -239,6 +240,32 @@ if (Test-Path $log) {
 
 Write-Host ''
 Ok '安装完成! 现在起会自动监测断网并自动登录, 无需再手动点登录。'
+
+# ---------- 首次使用引导: 真实点击校准 ----------
+if (-not $NoCalibrate) {
+    Write-Host ''
+    Write-Host '------------------------------------------------------------' -ForegroundColor Cyan
+    Write-Host ' 是否现在做一次"登录按钮校准"? (推荐, 约 1 分钟)' -ForegroundColor Yellow
+    Write-Host ' 校准过程: 工具帮你断开网络 -> 你手动点击一次客户端上的【登 录】'
+    Write-Host '           -> 工具自动记录这次真实点击的位置并验证'
+    Write-Host ' 作用: 适配你这台电脑的窗口尺寸/缩放, 保证断网后能自动点中按钮。'
+    Write-Host ' 跳过也没关系: 以后随时双击安装目录里的 校准按钮坐标.bat 重做。' -ForegroundColor DarkGray
+    Write-Host '------------------------------------------------------------' -ForegroundColor Cyan
+    $ans = Read-Host '现在校准? [Y/n]'
+    if (-not $ans -or ($ans -match '^[Yy]')) {
+        $calibScript = Join-Path $installDir 'tools\calibrate.ps1'
+        if (Test-Path $calibScript) {
+            & $calibScript
+        } else {
+            Warn '未找到校准脚本, 可稍后双击 校准按钮坐标.bat'
+        }
+    } else {
+        Info '已跳过校准, 之后可随时双击 校准按钮坐标.bat 校准'
+    }
+}
+
+Write-Host ''
 Info ('日志目录: ' + (Join-Path $installDir 'logs'))
-Info '常用命令: 在本目录放 command.txt 写 status / bounce / shot / click x y'
+Info '常用命令: 在本目录放 command.txt 写 status / bounce / disconnect / shot / click x y'
+Info ('重新校准: 双击 ' + (Join-Path $installDir '校准按钮坐标.bat'))
 Info '卸载: 双击同目录 "卸载.bat"'

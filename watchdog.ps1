@@ -39,6 +39,14 @@ $Config = [ordered]@{
     # 更换电脑/高DPI缩放时自动按窗口尺寸换算; 也可用 tools\calibrate.ps1 引导重新校准
     calib_win_w             = 533
     calib_win_h             = 914
+    # 真实点击参考 (由"校准按钮坐标"工具记录: 用户真实点击一次登录按钮的物理位置)
+    # 存在时前台真实点击优先使用它, 不再依赖换算
+    phys_btn_x              = -1
+    phys_btn_y              = -1
+    phys_win_w              = -1
+    phys_win_h              = -1
+    # 客户端"断 开"按钮的基线 y 坐标 (用于校准工具的辅助断开)
+    disconnect_btn_y        = 610
     check_interval_sec      = 20
     fail_threshold          = 2
     probe_timeout_ms        = 2000
@@ -87,6 +95,15 @@ $CalibWinW       = [int]$Config.calib_win_w
 $CalibWinH       = [int]$Config.calib_win_h
 if ($CalibWinW -lt 100) { $CalibWinW = 533 }
 if ($CalibWinH -lt 100) { $CalibWinH = 914 }
+
+# 真实点击参考 (校准工具实测记录; -1 表示未校准过)
+$PhysBtnX  = [int]$Config.phys_btn_x
+$PhysBtnY  = [int]$Config.phys_btn_y
+$PhysWinW  = [int]$Config.phys_win_w
+$PhysWinH  = [int]$Config.phys_win_h
+$HasPhysRef = ($PhysBtnX -ge 0 -and $PhysBtnY -ge 0 -and $PhysWinW -ge 200 -and $PhysWinH -ge 200)
+$DisconnectBtnY = 610
+if ($Config.Contains('disconnect_btn_y')) { $DisconnectBtnY = [int]$Config.disconnect_btn_y }
 
 # ----------------------------
 
@@ -245,6 +262,24 @@ function Get-ClickPoints {
     return @{ lpX = $lpX; lpY = $lpY; physX = $physX; physY = $physY }
 }
 
+function Get-DisconnectPoint {
+    # 已连接页面上"断 开"按钮的客户端坐标 (用于辅助断开/排查)
+    # y 按设计基线 914 换算 (610 是 533x914 窗口上的实测值)
+    param([IntPtr]$h)
+    $rect = Get-WindowRectSafe $h
+    $physW = $rect.Right - $rect.Left
+    $physH = $rect.Bottom - $rect.Top
+    if (($rect.Left -le -30000) -or ($physW -lt 200) -or ($physH -lt 200)) {
+        return @{ lpX = $LoginBtnOffsetX; lpY = $DisconnectBtnY }
+    }
+    $aware = Get-WindowAwareness $h
+    if ($aware -eq 0) { $logicalW = $CalibWinW; $logicalH = $CalibWinH }
+    else { $logicalW = $physW; $logicalH = $physH }
+    $lpX = [int][Math]::Round($LoginBtnOffsetX * $logicalW / $CalibWinW)
+    $lpY = [int][Math]::Round($DisconnectBtnY * $logicalH / 914)
+    return @{ lpX = $lpX; lpY = $lpY }
+}
+
 function Send-ClickToWindow {
     # 后台消息点击: 不移动真实鼠标, 锁屏状态下同样有效
     param([IntPtr]$h, [int]$x, [int]$y)
@@ -261,13 +296,23 @@ function Send-RealClick {
     $rect = Restore-ClientWindow $h
     if (-not $rect) { Log '客户端窗口无法恢复到前台'; return $false }
     Save-WindowShot $h 'pre-click'
-    $p = Get-ClickPoints $h
-    $sx = $rect.Left + $p.physX; $sy = $rect.Top + $p.physY
+    $physW = $rect.Right - $rect.Left; $physH = $rect.Bottom - $rect.Top
+    $src = '换算'
+    if ($HasPhysRef) {
+        # 校准工具记录的真实点击位置(已实测生效), 按窗口尺寸等比换算
+        $px = [int][Math]::Round($PhysBtnX * $physW / $PhysWinW)
+        $py = [int][Math]::Round($PhysBtnY * $physH / $PhysWinH)
+        $src = '真实点击参考'
+    } else {
+        $p = Get-ClickPoints $h
+        $px = $p.physX; $py = $p.physY
+    }
+    $sx = $rect.Left + $px; $sy = $rect.Top + $py
     [CampusWatch.Win32]::SetCursorPos($sx, $sy) | Out-Null
     Start-Sleep -Milliseconds 200
     [CampusWatch.Win32]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero)   # LEFTDOWN
     [CampusWatch.Win32]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero)   # LEFTUP
-    Log ('已前台点击 (' + $sx + ',' + $sy + ')')
+    Log ('已前台点击 (' + $sx + ',' + $sy + ') [' + $src + ']')
     Start-Sleep -Seconds 3
     [CampusWatch.Win32]::ShowWindow($h, 6) | Out-Null               # SW_MINIMIZE 收回托盘
     return $true
@@ -391,6 +436,14 @@ function Invoke-CommandFile {
                 Log ('命令click: 已发送后台点击 (' + $cx + ',' + $cy + ')')
             } else { Log 'click: 未找到客户端窗口' }
         }
+        'disconnect' {
+            $h = Find-ClientWebWindow
+            if ($h -ne [IntPtr]::Zero) {
+                $dp = Get-DisconnectPoint $h
+                Send-ClickToWindow $h $dp.lpX $dp.lpY
+                Log ('命令disconnect: 已发送断开点击 (' + $dp.lpX + ',' + $dp.lpY + ')')
+            } else { Log 'disconnect: 未找到客户端窗口' }
+        }
         'shot' {
             $h = Find-ClientWebWindow
             if ($h -ne [IntPtr]::Zero) {
@@ -427,6 +480,11 @@ if ($Check) {
                       $CalibWinW + 'x' + $CalibWinH + ') 窗口(' + ($rect.Right - $rect.Left) + 'x' +
                       ($rect.Bottom - $rect.Top) + ') 感知=' + (Get-WindowAwareness $h) +
                       ' -> 客户端坐标(' + $p.lpX + ',' + $p.lpY + ')')
+        if ($HasPhysRef) {
+            Write-Output ('真实点击参考: 物理(' + $PhysBtnX + ',' + $PhysBtnY + ') @窗口' + $PhysWinW + 'x' + $PhysWinH)
+        } else {
+            Write-Output '真实点击参考: 无 (未做过真实点击校准, 前台点击将使用换算坐标)'
+        }
     }
     exit 0
 }
