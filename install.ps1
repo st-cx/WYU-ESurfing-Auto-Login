@@ -1,0 +1,232 @@
+﻿# ============================================================
+#  五邑大学天翼校园自动登录工具 - 安装 / 卸载脚本
+#
+#  安装: 由 "一键安装.bat" 调用 (自动请求管理员权限)
+#        会做三件事:
+#          1. 自动探测天翼校园客户端安装目录和上网网卡
+#          2. 把看门狗复制到 当前用户\AppData\Local\CampusNetWatchdog 并生成 config.json
+#          3. 注册计划任务 CampusNetWatchdog (登录时自启, 最高权限) 并启动
+#
+#  卸载: 一键安装.bat 同目录的 "卸载.bat", 或: install.ps1 -Uninstall
+#  调试: powershell -ExecutionPolicy Bypass -File install.ps1 -DryRun   (只探测不安装)
+# ============================================================
+
+param(
+    [switch]$DryRun,      # 只探测并打印结果, 不安装
+    [switch]$Uninstall    # 卸载
+)
+
+$ErrorActionPreference = 'Stop'
+$Here = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+$TaskName = 'CampusNetWatchdog'
+
+function Info($m) { Write-Host ('[*] ' + $m) }
+function Ok($m)   { Write-Host ('[+] ' + $m) -ForegroundColor Green }
+function Warn($m) { Write-Host ('[!] ' + $m) -ForegroundColor Yellow }
+function Err($m)  { Write-Host ('[x] ' + $m) -ForegroundColor Red }
+
+function Test-Admin {
+    return ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Assert-Admin {
+    if (-not (Test-Admin)) {
+        Err '需要管理员权限, 请双击 "一键安装.bat" 运行 (会自动请求提权)'
+        exit 1
+    }
+}
+
+function Get-ConsoleUser {
+    # 当前登录(控制台)用户, 防止提权到其他管理员账号时把任务装错用户
+    $u = $null
+    try { $u = (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).UserName } catch {}
+    if (-not $u) { $u = "$env:USERDOMAIN\$env:USERNAME" }
+    return $u
+}
+
+function Get-InstallDir([string]$consoleUser) {
+    $name = $consoleUser.Split('\')[-1]
+    $profileDir = $null
+    try {
+        $profileDir = (Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue |
+            Where-Object { $_.LocalPath -and ($_.LocalPath.Split('\')[-1] -ieq $name) } |
+            Select-Object -First 1).LocalPath
+    } catch {}
+    if (-not $profileDir) { $profileDir = Join-Path 'C:\Users' $name }
+    return (Join-Path $profileDir 'AppData\Local\CampusNetWatchdog')
+}
+
+function Find-ClientDir {
+    # 1) 注册表卸载项 (最可靠, 含自定义安装路径)
+    $keys = @(
+        'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    )
+    $hits = Get-ItemProperty $keys -ErrorAction SilentlyContinue |
+        Where-Object { $_.DisplayName -and ($_.DisplayName -match '天翼校园|ESurfing|Chinatelecom|电信') }
+    foreach ($h in $hits) {
+        foreach ($field in @($h.DisplayIcon, $h.InstallLocation, $h.UninstallString)) {
+            if (-not $field) { continue }
+            $p = ($field -replace '"', '').Split(',')[0].Trim()
+            $d = $null
+            if (Test-Path -LiteralPath $p -PathType Container) { $d = $p }
+            elseif (Test-Path -LiteralPath $p) { $d = Split-Path -Parent $p }
+            if ($d -and (Test-Path (Join-Path $d 'ESurfingClient.exe'))) { return $d }
+        }
+    }
+    # 2) 常见路径扫描
+    $cands = @()
+    foreach ($root in @('C:', 'D:', 'E:', 'F:', 'G:')) {
+        $cands += "$root\software\Chinatelecom_GDPortal"
+        $cands += "$root\Program Files\Chinatelecom_GDPortal"
+        $cands += "$root\Program Files (x86)\Chinatelecom_GDPortal"
+        $cands += "$root\Chinatelecom_GDPortal"
+    }
+    foreach ($c in $cands) {
+        if (Test-Path (Join-Path $c 'ESurfingClient.exe')) { return $c }
+    }
+    return $null
+}
+
+function Find-Adapter {
+    $skip = 'Hyper-V|VMware|Virtual|Loopback|TAP|VPN|Bluetooth|WAN Miniport|Kernel Debug'
+    $cands = @(Get-NetAdapter -ErrorAction SilentlyContinue |
+        Where-Object { $_.Status -eq 'Up' -and $_.InterfaceDescription -notmatch $skip })
+    if ($cands.Count -eq 0) { return $null }
+    $wired = @($cands | Where-Object { $_.MediaType -eq '802.3' })
+    $pool = $cands
+    if ($wired.Count -gt 0) { $pool = $wired }
+    foreach ($a in $pool) {
+        $ip = Get-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Where-Object { $_.IPAddress -notlike '169.254.*' }
+        if ($ip) { return $a.Name }
+    }
+    return $pool[0].Name
+}
+
+# ==================== 卸载 ====================
+if ($Uninstall) {
+    Assert-Admin
+    $consoleUser = Get-ConsoleUser
+    $installDir = Get-InstallDir $consoleUser
+    Info ('结束并删除计划任务: ' + $TaskName)
+    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+    if (Test-Path $installDir) {
+        Info ('删除安装目录: ' + $installDir)
+        Remove-Item -LiteralPath $installDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Ok '卸载完成'
+    exit 0
+}
+
+# ==================== 探测 ====================
+Info '检测天翼校园客户端安装位置...'
+$clientDir = Find-ClientDir
+if (-not $clientDir) {
+    Warn '未能自动找到客户端 (需要 ESurfingClient.exe 所在目录)'
+    Warn '请先安装并登录一次 "天翼校园客户端", 然后重新运行本安装程序'
+    $clientDir = Read-Host '也可手动输入客户端安装目录 (直接回车取消)'
+    if (-not $clientDir) { exit 1 }
+    $clientDir = $clientDir.Trim().Trim('"')
+    if (-not (Test-Path (Join-Path $clientDir 'ESurfingClient.exe'))) {
+        Err ('该目录下没有 ESurfingClient.exe: ' + $clientDir)
+        exit 1
+    }
+}
+Ok ('客户端目录: ' + $clientDir)
+
+Info '检测上网网卡...'
+$adapterName = Find-Adapter
+if (-not $adapterName) {
+    Warn '未找到正在连接的网卡, 请确认有线网线已插好'
+    $adapterName = Read-Host '可手动输入网卡名称 (网络连接里看到的名称, 直接回车取消)'
+    if (-not $adapterName) { exit 1 }
+    $adapterName = $adapterName.Trim()
+}
+$upAdapters = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' })
+if ($upAdapters.Count -gt 1) {
+    Write-Host '检测到多个在用网卡:'
+    for ($i = 0; $i -lt $upAdapters.Count; $i++) {
+        Write-Host ('    [{0}] {1}  ({2})' -f ($i + 1), $upAdapters[$i].Name, $upAdapters[$i].InterfaceDescription)
+    }
+    $sel = Read-Host ('默认使用 [' + $adapterName + '], 回车确认, 或输入序号更换')
+    if ($sel) {
+        $n = 0
+        if ([int]::TryParse($sel, [ref]$n) -and $n -ge 1 -and $n -le $upAdapters.Count) {
+            $adapterName = $upAdapters[$n - 1].Name
+        }
+    }
+}
+Ok ('上网网卡: ' + $adapterName)
+
+$consoleUser = Get-ConsoleUser
+$installDir = Get-InstallDir $consoleUser
+
+if ($DryRun) {
+    Info '===== DryRun 结果 (未做任何改动) ====='
+    Info ('管理员权限: ' + (Test-Admin))
+    Info ('安装用户:   ' + $consoleUser)
+    Info ('安装目录:   ' + $installDir)
+    Info ('客户端目录: ' + $clientDir)
+    Info ('上网网卡:   ' + $adapterName)
+    exit 0
+}
+
+# ==================== 安装 ====================
+Assert-Admin
+
+Info ('安装到: ' + $installDir)
+New-Item -ItemType Directory -Path $installDir -Force | Out-Null
+New-Item -ItemType Directory -Path (Join-Path $installDir 'tools') -Force | Out-Null
+
+Copy-Item (Join-Path $Here 'watchdog.ps1') $installDir -Force
+$probe = Join-Path $Here 'tools\uia-probe.ps1'
+if (Test-Path $probe) { Copy-Item $probe (Join-Path $installDir 'tools') -Force }
+
+# 生成 config.json (保留用户已调过的其它项)
+$cfgPath = Join-Path $installDir 'config.json'
+$cfg = [ordered]@{}
+if (Test-Path $cfgPath) {
+    try {
+        $old = Get-Content $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        foreach ($p in $old.PSObject.Properties) { $cfg[$p.Name] = $p.Value }
+    } catch {}
+}
+$cfg['client_dir'] = $clientDir
+$cfg['adapter_name'] = $adapterName
+$json = $cfg | ConvertTo-Json
+[IO.File]::WriteAllText($cfgPath, $json, (New-Object Text.UTF8Encoding($false)))
+Ok ('配置已写入: ' + $cfgPath)
+
+Info '注册计划任务 (登录时自启, 最高权限)...'
+Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue   # 若旧实例在运行先结束
+$action = New-ScheduledTaskAction -Execute 'powershell.exe' `
+    -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' +
+               (Join-Path $installDir 'watchdog.ps1') + '"')
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User $consoleUser
+$trigger.Delay = 'PT20S'
+$principal = New-ScheduledTaskPrincipal -UserId $consoleUser -LogonType Interactive -RunLevel Highest
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+    -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) `
+    -StartWhenAvailable
+Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
+    -Principal $principal -Settings $settings -Force | Out-Null
+Start-ScheduledTask -TaskName $TaskName
+Start-Sleep -Seconds 6
+$t = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+if ($t) { Ok ('计划任务状态: ' + $t.State) } else { Warn '计划任务创建异常, 请截图反馈' }
+
+$log = Join-Path $installDir 'logs\watchdog.log'
+if (Test-Path $log) {
+    Ok '看门狗已开始工作, 最近日志:'
+    Get-Content $log -Tail 3 | ForEach-Object { Write-Host ('    ' + $_) }
+}
+
+Write-Host ''
+Ok '安装完成! 现在起会自动监测断网并自动登录, 无需再手动点登录。'
+Info ('日志目录: ' + (Join-Path $installDir 'logs'))
+Info '常用命令: 在本目录放 command.txt 写 status / bounce / shot / click x y'
+Info '卸载: 双击同目录 "卸载.bat"'

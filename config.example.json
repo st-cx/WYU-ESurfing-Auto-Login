@@ -1,0 +1,11 @@
+{
+    "client_dir": "C:\\Program Files (x86)\\Chinatelecom_GDPortal",
+    "adapter_name": "以太网",
+    "login_btn_x": 267,
+    "login_btn_y": 533,
+    "check_interval_sec": 20,
+    "fail_threshold": 2,
+    "nic_bounce_cooldown_sec": 180,
+    "client_start_wait_sec": 12,
+    "auth_settle_wait_sec": 75
+}

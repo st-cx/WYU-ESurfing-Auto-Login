@@ -1,0 +1,8 @@
+# --- 安装/运行产生的本地文件, 不要提交 ---
+config.json
+command.txt
+logs/
+*.log
+shot-*.png
+uia-probe.log
+client-window.png
