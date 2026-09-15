@@ -47,6 +47,13 @@ $Config = [ordered]@{
     phys_win_h              = -1
     # 客户端"断 开"按钮的基线 y 坐标 (用于校准工具的辅助断开)
     disconnect_btn_y        = 610
+    # 离校静默守卫: 本机 IPv4 前缀或默认网关匹配下列特征时才执行恢复动作,
+    # 否则(如带电脑回家/连热点/酒店WiFi)只记录日志并降频探活, 不折腾
+    # install.ps1 会自动探测写入; 关闭设为 false
+    campus_guard            = $false
+    campus_ip_prefixes      = @()
+    campus_gateways         = @()
+    away_check_interval_sec = 300
     check_interval_sec      = 20
     fail_threshold          = 2
     probe_timeout_ms        = 2000
@@ -86,6 +93,17 @@ $NicBounceCooldown  = [int]$Config.nic_bounce_cooldown_sec
 $ClientStartWaitSec = [int]$Config.client_start_wait_sec
 $AuthSettleWaitSec  = [int]$Config.auth_settle_wait_sec
 $ProbeTargets       = $Config.probe_targets
+
+# 离校静默守卫配置
+$CampusGuard = [bool]$Config.campus_guard
+$CampusIpPrefixes = @($Config.campus_ip_prefixes | Where-Object { $_ })
+$CampusGateways   = @($Config.campus_gateways | Where-Object { $_ })
+$AwayCheckIntervalSec = [int]$Config.away_check_interval_sec
+if ($AwayCheckIntervalSec -lt 60) { $AwayCheckIntervalSec = 300 }
+if ($CampusGuard -and $CampusIpPrefixes.Count -eq 0 -and $CampusGateways.Count -eq 0) {
+    # 配了守卫却没有特征值, 视为无效配置, 关闭守卫以免误拦恢复
+    $CampusGuard = $false
+}
 
 # 登录页"登 录"按钮中心, 相对客户端主窗口左上角 (默认值对应 533x914 标准窗口,
 # 实测登录页按钮在 y=533; 注意已连接页面的"断 开"按钮在 y=610, 两者布局不同)
@@ -154,6 +172,34 @@ function Test-Internet {
             }
         } catch {} finally { try { $c.Close() } catch {} }
     }
+    return $false
+}
+
+function Test-OnCampus {
+    # 离校静默守卫: 判断当前是否处于校园网环境
+    # 任一在用网卡 IPv4 的前两段匹配 campus_ip_prefixes, 或默认网关匹配
+    # campus_gateways, 即视为在校园网; 守卫未启用时恒为 true
+    if (-not $CampusGuard) { return $true }
+    $prefixes = @()
+    try {
+        $ips = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' }
+        foreach ($ip in $ips) {
+            $parts = $ip.IPAddress.Split('.')
+            if ($parts.Count -eq 4) { $prefixes += ($parts[0] + '.' + $parts[1] + '.') }
+        }
+    } catch {}
+    foreach ($want in $CampusIpPrefixes) {
+        if ($prefixes -contains $want) { return $true }
+    }
+    try {
+        $gws = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+            Where-Object { $_.NextHop -and $_.NextHop -ne '0.0.0.0' } |
+            Select-Object -ExpandProperty NextHop)
+        foreach ($want in $CampusGateways) {
+            if ($gws -contains $want) { return $true }
+        }
+    } catch {}
     return $false
 }
 
@@ -486,6 +532,18 @@ if ($Check) {
             Write-Output '真实点击参考: 无 (未做过真实点击校准, 前台点击将使用换算坐标)'
         }
     }
+    if ($CampusGuard) {
+        $curPrefixes = ''
+        try {
+            $curPrefixes = ((Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+                Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } |
+                ForEach-Object { ($_.IPAddress.Split('.')[0..1] -join '.') + '.' }) | Select-Object -Unique) -join ','
+        } catch {}
+        Write-Output ('离校守卫: 已启用 校园前缀=[' + ($CampusIpPrefixes -join ',') + '] 校园网关=[' +
+                      ($CampusGateways -join ',') + '] 当前IP前缀=[' + $curPrefixes + '] 判定在校园网=' + (Test-OnCampus))
+    } else {
+        Write-Output '离校守卫: 未启用 (config.json 里 campus_guard=true 可开启)'
+    }
     exit 0
 }
 
@@ -497,12 +555,14 @@ if (-not $mutex.WaitOne(0)) { exit 0 }
 Log '===== 校园网看门狗启动 ====='
 $fails = 0
 $lastBounce = Get-Date '2000-01-01'
+$awayMode = $false
 
 while ($true) {
     Invoke-CommandFile
 
     if (Test-Internet) {
         if ($fails -ge $FailThreshold) { Log '网络已恢复, 回到正常监测' }
+        if ($awayMode) { Log '已恢复网络'; $awayMode = $false }
         $fails = 0
         Start-Sleep -Seconds $CheckIntervalSec
         continue
@@ -513,6 +573,25 @@ while ($true) {
         Start-Sleep -Seconds $CheckIntervalSec
         continue
     }
+
+    # ---- 离校静默守卫: 不在校园网(回家/热点/酒店WiFi等)时不执行任何恢复动作 ----
+    if (-not (Test-OnCampus)) {
+        if (-not $awayMode) {
+            $awayMode = $true
+            $ips = ''
+            try {
+                $ips = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+                    Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } |
+                    Select-Object -ExpandProperty IPAddress) -join ','
+            } catch {}
+            Log ('探测失败, 但当前不在校园网环境 (本机IP: ' + $ips + '), 进入静默模式: 不重启客户端/不动网卡, 每 ' +
+                 [int]($AwayCheckIntervalSec / 60) + ' 分钟轻探一次')
+        }
+        $fails = 0
+        Start-Sleep -Seconds $AwayCheckIntervalSec
+        continue
+    }
+    if ($awayMode) { Log '已回到校园网环境, 恢复正常监测'; $awayMode = $false }
 
     Log '连续探测失败, 判定断网, 开始自动恢复'
     Send-Toast '检测到断网, 正在自动登录...'
