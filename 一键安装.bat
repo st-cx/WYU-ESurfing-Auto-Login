@@ -1,15 +1,22 @@
 @echo off
-chcp 65001 >nul
-title 五邑大学天翼校园自动登录工具 - 一键安装
+rem ============================================================
+rem  WYU ESurfing Auto Login - installer launcher
+rem  English/ASCII only on purpose:
+rem  cmd.exe mis-parses non-ASCII batch files on some codepages
+rem  (mojibake + line desync), so all Chinese text lives in
+rem  install.ps1 instead. Do not add non-ASCII characters here.
+rem ============================================================
+if /i "%~1"=="--elevated-run" goto admin
+
 cd /d "%~dp0"
-
 fltmc >nul 2>&1
-if %errorlevel%==0 goto admin
+if %errorlevel% equ 0 goto admin
 
 echo.
-echo  正在请求管理员权限，请在弹窗中点击"是"...
+echo  Requesting administrator privileges, please click "Yes"...
 echo.
-powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
+set "CNW_SELF=%~f0"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath $env:CNW_SELF -ArgumentList '--elevated-run' -Verb RunAs"
 exit /b
 
 :admin

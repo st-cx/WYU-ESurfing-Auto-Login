@@ -190,12 +190,15 @@ $calib = Join-Path $Here 'tools\calibrate.ps1'
 if (Test-Path $calib) { Copy-Item $calib (Join-Path $installDir 'tools') -Force }
 
 # 生成"校准按钮坐标.bat"到安装目录 (方便日后重新校准, 不依赖安装包)
+# 注意: bat 内容必须为纯 ASCII —— cmd 在部分代码页下解析含非 ASCII 的批处理
+# 会错位(乱码/执行残片), 中文提示一律由 calibrate.ps1 输出
 $calibBat = @"
 @echo off
-chcp 65001 >nul
-title 天翼校园自动登录工具 - 校准按钮坐标
-cd /d "%~dp0"
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\calibrate.ps1"
+if errorlevel 1 (
+  echo.
+  pause
+)
 "@
 [IO.File]::WriteAllText((Join-Path $installDir '校准按钮坐标.bat'), $calibBat, (New-Object Text.UTF8Encoding($false)))
 
