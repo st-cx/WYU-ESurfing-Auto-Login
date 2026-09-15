@@ -163,6 +163,37 @@ if ($upAdapters.Count -gt 1) {
 }
 Ok ('上网网卡: ' + $adapterName)
 
+# ---------- 探测校园网特征 (供"离校静默"守卫: 不在校园网时不折腾) ----------
+Info '探测校园网特征 (离校静默守卫)...'
+$ipPrefixes = @()
+try {
+    $ips = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' }
+    foreach ($ip in $ips) {
+        $parts = $ip.IPAddress.Split('.')
+        if ($parts.Count -eq 4) { $ipPrefixes += ($parts[0] + '.' + $parts[1] + '.') }
+    }
+    $ipPrefixes = @($ipPrefixes | Select-Object -Unique)
+} catch {}
+$gateways = @()
+try {
+    $gateways = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+        Where-Object { $_.NextHop -and $_.NextHop -ne '0.0.0.0' } |
+        Select-Object -ExpandProperty NextHop | Select-Object -Unique)
+} catch {}
+
+$campusGuard = $true
+$privatePrefixes = @($ipPrefixes | Where-Object { $_ -match '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)$' })
+if ($ipPrefixes.Count -eq 0) {
+    $campusGuard = $false
+    Warn '未能获取本机 IP, 已关闭"离校静默"守卫 (稍后可在 config.json 手动配置)'
+} elseif ($privatePrefixes.Count -eq $ipPrefixes.Count) {
+    # 全是家用/普通私网地址, 判定当前可能不在校园网 → 关闭守卫(避免回校后无法自动恢复)
+    $campusGuard = $false
+    Warn ('当前网络看起来不是校园网 (IP前缀: ' + ($ipPrefixes -join ',') + '), 已关闭"离校静默"守卫;')
+    Warn '  如果你现在就在校园网, 可重新运行安装, 或稍后在 config.json 设置 campus_guard=true'
+}
+
 $consoleUser = Get-ConsoleUser
 $installDir = Get-InstallDir $consoleUser
 
@@ -173,6 +204,7 @@ if ($DryRun) {
     Info ('安装目录:   ' + $installDir)
     Info ('客户端目录: ' + $clientDir)
     Info ('上网网卡:   ' + $adapterName)
+    Info ('离校守卫:   启用=' + $campusGuard + ' 前缀=[' + ($ipPrefixes -join ',') + '] 网关=[' + ($gateways -join ',') + ']')
     exit 0
 }
 
@@ -214,6 +246,26 @@ if (Test-Path $cfgPath) {
 }
 $cfg['client_dir'] = $clientDir
 $cfg['adapter_name'] = $adapterName
+
+# 离校静默守卫: 已有有效配置则保留(避免覆盖用户手工调整), 否则写入本次探测结果
+$keepCampus = $false
+if ($cfg.Contains('campus_guard') -and $cfg['campus_guard'] -eq $true -and
+    (($cfg['campus_ip_prefixes'] | Where-Object { $_ }) -or ($cfg['campus_gateways'] | Where-Object { $_ }))) {
+    $keepCampus = $true
+}
+if ($keepCampus) {
+    Ok ('保留已有校园网特征: 前缀=[' + (@($cfg['campus_ip_prefixes']) -join ',') + '] 网关=[' +
+        (@($cfg['campus_gateways']) -join ',') + ']')
+} elseif ($campusGuard) {
+    $cfg['campus_guard'] = $true
+    $cfg['campus_ip_prefixes'] = $ipPrefixes
+    $cfg['campus_gateways'] = $gateways
+    Ok ('离校守卫已启用: 校园IP前缀=[' + ($ipPrefixes -join ',') + '] 网关=[' + ($gateways -join ',') + ']')
+    Info '  (带电脑去其他地方/连热点时, 探测失败也不会重启客户端或动网卡)'
+} else {
+    $cfg['campus_guard'] = $false
+}
+
 $json = $cfg | ConvertTo-Json
 [IO.File]::WriteAllText($cfgPath, $json, (New-Object Text.UTF8Encoding($false)))
 Ok ('配置已写入: ' + $cfgPath)
