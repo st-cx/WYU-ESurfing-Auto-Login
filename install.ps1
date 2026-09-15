@@ -200,6 +200,7 @@ if errorlevel 1 (
   pause
 )
 "@
+$calibBat = $calibBat -replace "`r?`n", "`r`n"   # 批处理统一用 CRLF 换行
 [IO.File]::WriteAllText((Join-Path $installDir '校准按钮坐标.bat'), $calibBat, (New-Object Text.UTF8Encoding($false)))
 
 # 生成 config.json (保留用户已调过的其它项)
