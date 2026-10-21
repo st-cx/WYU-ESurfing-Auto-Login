@@ -92,7 +92,7 @@ function Find-ClientDir {
 }
 
 function Find-Adapter {
-    $skip = 'Hyper-V|VMware|Virtual|Loopback|TAP|VPN|Bluetooth|WAN Miniport|Kernel Debug'
+    $skip = 'Hyper-V|VMware|Virtual|Loopback|TAP|VPN|Bluetooth|WAN Miniport|Kernel Debug|Clash|Mihomo|TUN|Tailscale|WireGuard'
     $cands = @(Get-NetAdapter -ErrorAction SilentlyContinue |
         Where-Object { $_.Status -eq 'Up' -and $_.InterfaceDescription -notmatch $skip })
     if ($cands.Count -eq 0) { return $null }
@@ -114,6 +114,13 @@ if ($Uninstall) {
     $installDir = Get-InstallDir $consoleUser
     Info ('结束并删除计划任务: ' + $TaskName)
     Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    $networkState = Join-Path $installDir 'proxy-recovery.json'
+    if (Test-Path -LiteralPath $networkState) {
+        . (Join-Path $Here 'network.ps1')
+        if (-not (Restore-AuthNetworkContext -StatePath $networkState)) {
+            throw '代理尚未恢复, 已保留安装目录。请启动 Clash 后重试卸载。'
+        }
+    }
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
     if (Test-Path $installDir) {
         Info ('删除安装目录: ' + $installDir)
@@ -148,7 +155,7 @@ if (-not $adapterName) {
     $adapterName = $adapterName.Trim()
 }
 $upAdapters = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' })
-if ($upAdapters.Count -gt 1) {
+if ($upAdapters.Count -gt 1 -and -not $NoCalibrate) {
     Write-Host '检测到多个在用网卡:'
     for ($i = 0; $i -lt $upAdapters.Count; $i++) {
         Write-Host ('    [{0}] {1}  ({2})' -f ($i + 1), $upAdapters[$i].Name, $upAdapters[$i].InterfaceDescription)
@@ -167,7 +174,7 @@ Ok ('上网网卡: ' + $adapterName)
 Info '探测校园网特征 (离校静默守卫)...'
 $ipPrefixes = @()
 try {
-    $ips = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+    $ips = Get-NetIPAddress -InterfaceAlias $adapterName -AddressFamily IPv4 -ErrorAction SilentlyContinue |
         Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' }
     foreach ($ip in $ips) {
         $parts = $ip.IPAddress.Split('.')
@@ -177,7 +184,7 @@ try {
 } catch {}
 $gateways = @()
 try {
-    $gateways = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+    $gateways = @(Get-NetRoute -InterfaceAlias $adapterName -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
         Where-Object { $_.NextHop -and $_.NextHop -ne '0.0.0.0' } |
         Select-Object -ExpandProperty NextHop | Select-Object -Unique)
 } catch {}
@@ -211,11 +218,21 @@ if ($DryRun) {
 # ==================== 安装 ====================
 Assert-Admin
 
+Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 2   # 等旧进程释放全局互斥锁, 避免新实例启动后立即退出
+$networkState = Join-Path $installDir 'proxy-recovery.json'
+if (Test-Path -LiteralPath $networkState) {
+    . (Join-Path $Here 'network.ps1')
+    if (-not (Restore-AuthNetworkContext -StatePath $networkState)) {
+        throw '代理尚未恢复, 已暂停升级。请启动 Clash 后重试安装。'
+    }
+}
 Info ('安装到: ' + $installDir)
 New-Item -ItemType Directory -Path $installDir -Force | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $installDir 'tools') -Force | Out-Null
 
 Copy-Item (Join-Path $Here 'watchdog.ps1') $installDir -Force
+Copy-Item (Join-Path $Here 'network.ps1') $installDir -Force
 $probe = Join-Path $Here 'tools\uia-probe.ps1'
 if (Test-Path $probe) { Copy-Item $probe (Join-Path $installDir 'tools') -Force }
 $calib = Join-Path $Here 'tools\calibrate.ps1'
@@ -286,7 +303,13 @@ Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
 Start-ScheduledTask -TaskName $TaskName
 Start-Sleep -Seconds 6
 $t = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-if ($t) { Ok ('计划任务状态: ' + $t.State) } else { Warn '计划任务创建异常, 请截图反馈' }
+if ($t -and $t.State -eq 'Ready' -and (Get-ScheduledTaskInfo -TaskName $TaskName).LastTaskResult -eq 0) {
+    Start-ScheduledTask -TaskName $TaskName
+    Start-Sleep -Seconds 3
+    $t = Get-ScheduledTask -TaskName $TaskName
+}
+if ($t -and $t.State -eq 'Running') { Ok ('计划任务状态: ' + $t.State) }
+else { throw '计划任务未保持运行, 请检查日志后重新安装' }
 
 $log = Join-Path $installDir 'logs\watchdog.log'
 if (Test-Path $log) {

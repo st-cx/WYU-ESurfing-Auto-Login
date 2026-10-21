@@ -6,3 +6,4 @@ logs/
 shot-*.png
 uia-probe.log
 client-window.png
+proxy-recovery.json*

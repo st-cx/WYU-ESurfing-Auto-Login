@@ -3,7 +3,7 @@
 #  适用于: 五邑大学天翼校园客户端 (广东电信 GDPortal / ESurfingClient)
 #
 #  功能:
-#    - 每 check_interval_sec 秒探测外网连通性
+#    - 每 check_interval_sec 秒验证外网 HTTP 响应 (避免 Clash TUN 的 TCP 假阳性)
 #    - 连续 fail_threshold 次失败判定断网, 自动执行恢复梯子:
 #        第1级: 重启客户端 + 后台点击"登 录"按钮 (不抢鼠标, 锁屏也有效)
 #        第2级: 禁用/启用网卡 + 重启客户端 + 再点登录 (带冷却, 防反复断网)
@@ -21,7 +21,9 @@
 # ============================================================
 
 param(
-    [switch]$Check   # 仅执行一次探活并输出状态后退出 (调试用)
+    [switch]$Check,           # 仅探活, 不修改代理/客户端/网卡
+    [switch]$RecoverOnce,     # 仅执行一次自动恢复 (排障/验收用)
+    [switch]$RestoreNetwork   # 仅恢复上次认证临时修改的代理设置
 )
 
 $ErrorActionPreference = 'Continue'
@@ -60,10 +62,12 @@ $Config = [ordered]@{
     nic_bounce_cooldown_sec = 180
     client_start_wait_sec   = 12
     auth_settle_wait_sec    = 75
-    probe_targets           = @(
-        @{ ip = '223.5.5.5';       port = 443 },
-        @{ ip = '119.29.29.29';    port = 53 },
-        @{ ip = '114.114.114.114'; port = 53 }
+    proxy_guard             = $true
+    clash_config_path       = ''
+    http_probe_targets      = @(
+        @{ url = 'http://connect.rom.miui.com/generate_204'; status = 204; body = '' },
+        @{ url = 'http://wifi.vivo.com.cn/generate_204'; status = 204; body = '' },
+        @{ url = 'http://www.msftconnecttest.com/connecttest.txt'; status = 200; body = 'Microsoft Connect Test' }
     )
 }
 $configPath = Join-Path $Root 'config.json'
@@ -92,7 +96,9 @@ $ProbeTimeoutMs     = [int]$Config.probe_timeout_ms
 $NicBounceCooldown  = [int]$Config.nic_bounce_cooldown_sec
 $ClientStartWaitSec = [int]$Config.client_start_wait_sec
 $AuthSettleWaitSec  = [int]$Config.auth_settle_wait_sec
-$ProbeTargets       = $Config.probe_targets
+$HttpProbeTargets   = $Config.http_probe_targets
+. (Join-Path $Root 'network.ps1')
+$NetworkStatePath   = Join-Path $Root 'proxy-recovery.json'
 
 # 离校静默守卫配置
 $CampusGuard = [bool]$Config.campus_guard
@@ -163,16 +169,7 @@ function Log {
 if ($configError) { Log ('config.json 解析失败, 已改用默认配置 (请检查文件格式): ' + $configError) }
 
 function Test-Internet {
-    foreach ($t in $ProbeTargets) {
-        $c = New-Object System.Net.Sockets.TcpClient
-        try {
-            $iar = $c.BeginConnect($t.ip, $t.port, $null, $null)
-            if ($iar.AsyncWaitHandle.WaitOne($ProbeTimeoutMs) -and $c.Connected) {
-                $c.Close(); return $true
-            }
-        } catch {} finally { try { $c.Close() } catch {} }
-    }
-    return $false
+    return (Test-InternetHttp -Targets $HttpProbeTargets -TimeoutMs $ProbeTimeoutMs)
 }
 
 function Test-OnCampus {
@@ -182,7 +179,7 @@ function Test-OnCampus {
     if (-not $CampusGuard) { return $true }
     $prefixes = @()
     try {
-        $ips = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        $ips = Get-NetIPAddress -InterfaceAlias $AdapterName -AddressFamily IPv4 -ErrorAction SilentlyContinue |
             Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' }
         foreach ($ip in $ips) {
             $parts = $ip.IPAddress.Split('.')
@@ -193,7 +190,7 @@ function Test-OnCampus {
         if ($prefixes -contains $want) { return $true }
     }
     try {
-        $gws = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+        $gws = @(Get-NetRoute -InterfaceAlias $AdapterName -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
             Where-Object { $_.NextHop -and $_.NextHop -ne '0.0.0.0' } |
             Select-Object -ExpandProperty NextHop)
         foreach ($want in $CampusGateways) {
@@ -389,6 +386,10 @@ function Wait-AuthSettle {
     # 点击/重启后耐心等客户端完成认证, 避免过早重启打断它的登录流程
     $deadline = (Get-Date).AddSeconds($AuthSettleWaitSec)
     while ((Get-Date) -lt $deadline) {
+        if ($script:RecoveryDeadline -and (Get-Date) -ge $script:RecoveryDeadline) { throw 'Recovery deadline reached.' }
+        if (Test-Path -LiteralPath $NetworkStatePath) {
+            Update-AuthNetworkContext -StatePath $NetworkStatePath -ClashConfigPath $Config.clash_config_path
+        }
         if (Test-Internet) { return $true }
         Start-Sleep -Seconds 8
     }
@@ -418,7 +419,9 @@ function Wait-AdapterUp {
             $ad = Get-NetAdapter -Name $AdapterName -ErrorAction Stop
             if ($ad.Status -eq 'Up') {
                 $ip = Get-NetIPAddress -InterfaceAlias $AdapterName -AddressFamily IPv4 -ErrorAction SilentlyContinue
-                if ($ip) { return $true }
+                $ready = @($ip | Where-Object { $_.AddressState -eq 'Preferred' -and
+                    $_.IPAddress -notlike '169.254.*' -and $_.IPAddress -notlike '127.*' })
+                if ($ready.Count) { return $true }
             }
         } catch {}
         Start-Sleep -Seconds 2
@@ -439,6 +442,106 @@ function Repair-NicAdapter {
     $up = Wait-AdapterUp -TimeoutSec 45
     Log ('网卡恢复状态: ' + $up)
     return $up
+}
+
+function Invoke-CampusRecovery {
+    # One bounded cycle; restore proxies on success, failure, or a terminating error.
+    try {
+        if (-not (Wait-AdapterUp -TimeoutSec 45)) {
+            Log '物理网卡尚未就绪, 等待有效 IPv4 后重试, 本轮不重启客户端'
+            return $false
+        }
+        if ($Config.proxy_guard) {
+            if (Test-Path -LiteralPath $NetworkStatePath) {
+                Update-AuthNetworkContext -StatePath $NetworkStatePath -ClashConfigPath $Config.clash_config_path
+            } else {
+                Enter-AuthNetworkContext -StatePath $NetworkStatePath -ClashConfigPath $Config.clash_config_path
+            }
+        }
+        if (Test-Internet) { return $true }
+        Restart-Client
+        if ($Config.proxy_guard) {
+            Update-AuthNetworkContext -StatePath $NetworkStatePath -ClashConfigPath $Config.clash_config_path
+        }
+        if (Test-Internet) { return $true }
+        Invoke-LoginClick | Out-Null
+        if (Wait-AuthSettle) { Log '恢复成功 (重启客户端/点击登录, HTTP验证通过)'; return $true }
+        Log '第1级恢复未成功'
+
+        if (((Get-Date) - $script:lastBounce).TotalSeconds -le $NicBounceCooldown) {
+            Log '网卡重启冷却中, 本轮跳过'
+            return $false
+        }
+        $script:lastBounce = Get-Date
+        if (-not (Repair-NicAdapter)) { return $false }
+        Send-Toast '已重启网卡, 正在重新登录...'
+        Restart-Client
+        if ($Config.proxy_guard) {
+            Update-AuthNetworkContext -StatePath $NetworkStatePath -ClashConfigPath $Config.clash_config_path
+        }
+        if (Test-Internet) { return $true }
+        Invoke-LoginClick | Out-Null
+        if (Wait-AuthSettle) { Log '恢复成功 (网卡重启后登录, HTTP验证通过)'; return $true }
+        Log '第2级恢复未成功, 稍后继续重试'
+        return $false
+    } catch {
+        # Do not include exception text that could contain controller/PAC credentials.
+        Log ('本轮恢复异常, 将恢复代理并重试: ' + $_.Exception.GetType().Name)
+        return $false
+    } finally {
+        if (-not (Restore-AuthNetworkContext -StatePath $NetworkStatePath)) {
+            Log '代理恢复尚未完成, 下轮优先重试恢复原设置'
+        }
+    }
+}
+
+function Invoke-ReconnectSelfTest([string]$Id, [datetime]$Deadline) {
+    $report = [ordered]@{ id = $Id; deadline = $Deadline.ToString('o'); passed = $false;
+        tun_stopped = $false; disconnected = $false; restored = $false }
+    $reportPath = Join-Path $LogDir ('reconnect-test-' + $Id + '.json')
+    try {
+        $script:RecoveryDeadline = $Deadline
+        if ((Get-Date) -ge $Deadline) { throw 'Deadline reached before test start.' }
+        if (-not (Test-Internet)) { throw 'Initial network is offline.' }
+        $originalProxy = (Get-SystemProxyValue 'ProxyEnable').value
+        $originalMode = (Invoke-ClashApi (Get-LocalClashController -ConfigPath $Config.clash_config_path)).mode
+        $originalTun = Test-ClashTunActive
+        Enter-AuthNetworkContext -StatePath $NetworkStatePath -ClashConfigPath $Config.clash_config_path
+        $report.tun_stopped = -not (Test-ClashTunActive)
+        if (-not $report.tun_stopped) { throw 'TUN did not actually stop.' }
+        Restart-Client
+        $h = Find-ClientWebWindow
+        if ($h -eq [IntPtr]::Zero) { throw 'Client window is missing.' }
+        $dp = Get-DisconnectPoint $h
+        Send-ClickToWindow $h $dp.lpX $dp.lpY
+        $offlineDeadline = (Get-Date).AddSeconds(12)
+        while ((Get-Date) -lt $offlineDeadline) {
+            if (-not (Test-Internet)) { $report.disconnected = $true; break }
+            Start-Sleep -Milliseconds 300
+        }
+        if (-not $report.disconnected) { throw 'Client did not actually disconnect.' }
+        Log '限时重测: TUN 已停止并已确认真实断网, 开始自动登录'
+        if (-not (Invoke-CampusRecovery)) { throw 'Automatic authentication failed.' }
+        $report.restored = Restore-AuthNetworkContext -StatePath $NetworkStatePath
+        if (-not $report.restored) { throw 'Network setting restoration is pending.' }
+        $mode = (Invoke-ClashApi (Get-LocalClashController -ConfigPath $Config.clash_config_path)).mode
+        if ($mode -ne $originalMode -or (Test-ClashTunActive) -ne $originalTun -or
+            (Get-SystemProxyValue 'ProxyEnable').value -ne $originalProxy) { throw 'Original proxy/TUN settings do not match.' }
+        if (-not (Wait-InternetHttp -Targets $HttpProbeTargets -TimeoutMs $ProbeTimeoutMs -Deadline $Deadline)) {
+            throw 'Internet failed after restoring proxy/TUN.'
+        }
+        if ((Get-Date) -ge $Deadline) { throw 'Three-minute deadline reached.' }
+        $report.passed = $true
+        Log '限时重测通过: 真实断网后自动登录成功, 代理与TUN已恢复'
+    } catch {
+        $report.error = $_.Exception.Message
+        Log ('限时重测未通过: ' + $_.Exception.GetType().Name)
+    } finally {
+        $script:RecoveryDeadline = $null
+        $report.restored = Restore-AuthNetworkContext -StatePath $NetworkStatePath
+        $report.finished = (Get-Date).ToString('o')
+        [IO.File]::WriteAllText($reportPath, ($report | ConvertTo-Json), (New-Object Text.UTF8Encoding($false)))
+    }
 }
 
 function Send-Toast {
@@ -466,6 +569,23 @@ function Invoke-CommandFile {
     if (-not $cmd) { return }
     Log ('收到命令: ' + $cmd)
     switch -Regex ($cmd) {
+        '^test-reconnect ([0-9a-f]{32}) ([0-9]{10})$' {
+            $testId = $Matches[1]
+            $deadline = [DateTimeOffset]::FromUnixTimeSeconds([long]$Matches[2]).LocalDateTime
+            # Bound even a manually submitted diagnostic request to three minutes.
+            if ($deadline -gt (Get-Date).AddMinutes(3)) { $deadline = (Get-Date).AddMinutes(3) }
+            Invoke-ReconnectSelfTest -Id $testId -Deadline $deadline
+        }
+        '^restart-client$' {
+            Restart-Client
+            Log 'restart-client: completed'
+        }
+        '^enable-adapter$' {
+            try {
+                Enable-NetAdapter -Name $AdapterName -Confirm:$false -ErrorAction Stop
+                Log 'enable-adapter: completed'
+            } catch { Log 'enable-adapter: failed' }
+        }
         'bounce' {
             $script:lastBounce = Get-Date
             $ok = Repair-NicAdapter
@@ -488,6 +608,7 @@ function Invoke-CommandFile {
                 $dp = Get-DisconnectPoint $h
                 Send-ClickToWindow $h $dp.lpX $dp.lpY
                 Log ('命令disconnect: 已发送断开点击 (' + $dp.lpX + ',' + $dp.lpY + ')')
+                Log 'disconnect: sent'
             } else { Log 'disconnect: 未找到客户端窗口' }
         }
         'shot' {
@@ -514,6 +635,8 @@ if ($Check) {
     $adStatus = '未找到'
     if ($ad) { $adStatus = $ad.Status }
     Write-Output ('在线:   ' + (Test-Internet))
+    Write-Output '探活:   HTTP 状态码 + 正文校验 (禁用请求代理/重定向/缓存)'
+    Write-Output ('代理保护: ' + [bool]$Config.proxy_guard + '  待恢复设置: ' + (Test-Path -LiteralPath $NetworkStatePath))
     Write-Output ('网卡:   ' + $AdapterName + ' -> ' + $adStatus)
     Write-Output ('客户端: ' + [bool](Get-Process -Name $ClientProc -ErrorAction SilentlyContinue) +
                   '  窗口: ' + (Find-ClientWebWindow))
@@ -535,7 +658,7 @@ if ($Check) {
     if ($CampusGuard) {
         $curPrefixes = ''
         try {
-            $curPrefixes = ((Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            $curPrefixes = ((Get-NetIPAddress -InterfaceAlias $AdapterName -AddressFamily IPv4 -ErrorAction SilentlyContinue |
                 Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } |
                 ForEach-Object { ($_.IPAddress.Split('.')[0..1] -join '.') + '.' }) | Select-Object -Unique) -join ','
         } catch {}
@@ -549,15 +672,38 @@ if ($Check) {
 
 # ---------- 单实例保护 ----------
 $mutex = New-Object System.Threading.Mutex($false, 'Global\CampusNetWatchdogMutex')
-if (-not $mutex.WaitOne(0)) { exit 0 }
+try { $ownsMutex = $mutex.WaitOne(0) }
+catch [System.Threading.AbandonedMutexException] { $ownsMutex = $true }
+if (-not $ownsMutex) {
+    $mutex.Dispose()
+    if ($RecoverOnce -or $RestoreNetwork) { Write-Output '看门狗已在运行, 请先停止计划任务再执行单次调试'; exit 3 }
+    exit 0
+}
 
 # ---------- 主循环 ----------
-Log '===== 校园网看门狗启动 ====='
+Log '===== 校园网看门狗启动 v1.4.0 ====='
 $fails = 0
 $lastBounce = Get-Date '2000-01-01'
 $awayMode = $false
 
+try {
+if ($RestoreNetwork) {
+    if (Restore-AuthNetworkContext -StatePath $NetworkStatePath) { exit 0 }
+    exit 1
+}
+if ($RecoverOnce) {
+    if (-not (Restore-AuthNetworkContext -StatePath $NetworkStatePath)) { exit 1 }
+    if (-not (Test-OnCampus)) { Log '不在校园网, 跳过单次恢复'; exit 2 }
+    if (Test-Internet) { Log 'HTTP验证已在线, 无需恢复'; exit 0 }
+    if ((Invoke-CampusRecovery) -and -not (Test-Path -LiteralPath $NetworkStatePath) -and
+        (Wait-InternetHttp -Targets $HttpProbeTargets -TimeoutMs $ProbeTimeoutMs)) { exit 0 }
+    exit 1
+}
 while ($true) {
+    if (-not (Restore-AuthNetworkContext -StatePath $NetworkStatePath)) {
+        Start-Sleep -Seconds $CheckIntervalSec
+        continue
+    }
     Invoke-CommandFile
 
     if (Test-Internet) {
@@ -596,38 +742,19 @@ while ($true) {
     Log '连续探测失败, 判定断网, 开始自动恢复'
     Send-Toast '检测到断网, 正在自动登录...'
 
-    # ---- 第 1 级: 重启客户端 + 自动点击登录 ----
-    Restart-Client
-    Invoke-LoginClick | Out-Null
-    if (Wait-AuthSettle) {
-        Log '恢复成功 (重启客户端/点击登录)'
+    if ((Invoke-CampusRecovery) -and -not (Test-Path -LiteralPath $NetworkStatePath) -and
+        (Wait-InternetHttp -Targets $HttpProbeTargets -TimeoutMs $ProbeTimeoutMs)) {
+        Log '代理/TUN恢复后HTTP验证通过, 回到正常监测'
         Send-Toast '校园网已自动恢复上网'
         $fails = 0
         Start-Sleep -Seconds $CheckIntervalSec
         continue
     }
-    Log '第1级恢复未成功'
-
-    # ---- 第 2 级: 网卡禁用/启用 (带冷却) ----
-    $cooldownOk = ((Get-Date) - $lastBounce).TotalSeconds -gt $NicBounceCooldown
-    if ($cooldownOk) {
-        $lastBounce = Get-Date
-        Repair-NicAdapter | Out-Null
-        Send-Toast '已重启网卡, 正在重新登录...'
-        Restart-Client
-        Invoke-LoginClick | Out-Null
-        if (Wait-AuthSettle) {
-            Log '恢复成功 (网卡重启后登录)'
-            Send-Toast '校园网已自动恢复上网'
-            $fails = 0
-            Start-Sleep -Seconds $CheckIntervalSec
-            continue
-        }
-        Log '第2级恢复未成功, 稍后继续重试'
-    } else {
-        Log '网卡重启冷却中, 本轮跳过'
-    }
-
     $fails = 1   # 让梯子约40秒后重走
     Start-Sleep -Seconds $CheckIntervalSec
+}
+} finally {
+    Restore-AuthNetworkContext -StatePath $NetworkStatePath | Out-Null
+    $mutex.ReleaseMutex()
+    $mutex.Dispose()
 }

@@ -121,15 +121,10 @@ function Find-ClientWebWindow {
     return $script:foundHwnd
 }
 
+. (Join-Path $InstallDir 'network.ps1')
 function Test-Internet {
-    foreach ($t in @(@{ip='223.5.5.5';port=443}, @{ip='119.29.29.29';port=53}, @{ip='114.114.114.114';port=53})) {
-        $c = New-Object System.Net.Sockets.TcpClient
-        try {
-            $iar = $c.BeginConnect($t.ip, $t.port, $null, $null)
-            if ($iar.AsyncWaitHandle.WaitOne(2000) -and $c.Connected) { $c.Close(); return $true }
-        } catch {} finally { try { $c.Close() } catch {} }
-    }
-    return $false
+    if ($Config.Contains('http_probe_targets')) { return (Test-InternetHttp -Targets $Config.http_probe_targets) }
+    return (Test-InternetHttp)
 }
 
 function Get-WindowAwareness([IntPtr]$h) {

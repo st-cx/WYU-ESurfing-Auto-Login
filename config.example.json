@@ -18,5 +18,12 @@
     "fail_threshold": 2,
     "nic_bounce_cooldown_sec": 180,
     "client_start_wait_sec": 12,
-    "auth_settle_wait_sec": 75
+    "auth_settle_wait_sec": 75,
+    "proxy_guard": true,
+    "clash_config_path": "",
+    "http_probe_targets": [
+        {"url": "http://connect.rom.miui.com/generate_204", "status": 204, "body": ""},
+        {"url": "http://wifi.vivo.com.cn/generate_204", "status": 204, "body": ""},
+        {"url": "http://www.msftconnecttest.com/connecttest.txt", "status": 200, "body": "Microsoft Connect Test"}
+    ]
 }
