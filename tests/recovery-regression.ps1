@@ -1,4 +1,4 @@
-param([string]$RepoRoot = (Split-Path -Parent $PSScriptRoot))
+﻿param([string]$RepoRoot = (Split-Path -Parent $PSScriptRoot))
 $ErrorActionPreference = 'Stop'
 $tokens = $null; $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $RepoRoot 'watchdog.ps1'), [ref]$tokens, [ref]$errors)
@@ -14,6 +14,9 @@ $NetworkStatePath = 'unused-test-state'
 $NicBounceCooldown = 180
 $script:lastBounce = Get-Date '2000-01-01'
 $script:events = New-Object 'Collections.Generic.List[string]'
+$script:lockAvailable = $true
+function Get-AuthenticationLock { if ($script:lockAvailable) { return [pscustomobject]@{fixture=$true} }; return $null }
+function Release-AuthenticationLock($Mutex) {}
 function Log([string]$Message) {}
 function Send-Toast([string]$Message) {}
 function Enter-AuthNetworkContext { $script:events.Add('enter') }
@@ -48,6 +51,11 @@ Assert-True (-not (Invoke-CampusRecovery)) 'Failed authentication cannot report 
 Assert-True (-not $script:events.Contains('bounce')) 'Adapter cooldown must survive the proxy recovery change.'
 Assert-True ($script:events[$script:events.Count - 1] -eq 'restore') 'Failed authentication must restore proxies.'
 Write-Output 'PASS: authentication failure preserves the adapter cooldown and restores proxies.'
+
+$script:events.Clear(); $script:lockAvailable = $false
+Assert-True (-not (Invoke-CampusRecovery)) 'A competing authentication must defer recovery.'
+Assert-True ($script:events.Count -eq 0) 'A competing authentication must not restore proxies, restart, click, or bounce.'
+Write-Output 'PASS: a competing authentication cannot be interrupted by recovery.'
 
 $CampusGuard = $true; $CampusIpPrefixes = @('100.2.'); $CampusGateways = @('100.2.0.1'); $AdapterName = 'Ethernet'
 function Get-NetIPAddress([string]$InterfaceAlias) {

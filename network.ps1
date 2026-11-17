@@ -1,4 +1,4 @@
-# Shared network checks. Compatible with Windows PowerShell 5.1; no external modules.
+﻿# Shared network checks. Compatible with Windows PowerShell 5.1; no external modules.
 function Test-InternetHttp {
     param(
         [object[]]$Targets = @(
@@ -90,33 +90,96 @@ public static extern bool InternetSetOption(System.IntPtr hInternet, int option,
 }
 
 function Get-LocalClashController([string]$ConfigPath = '') {
+    $candidates = @($ConfigPath)
     if (-not $ConfigPath) {
         $candidates = @(
-            (Join-Path $env:USERPROFILE '.config\clash\config.yaml'),
             (Join-Path $env:APPDATA 'io.github.clash-verge-rev.clash-verge-rev\clash-verge.yaml'),
-            (Join-Path $env:APPDATA 'io.github.clash-verge-rev.clash-verge-rev\clash.yaml')
+            (Join-Path $env:APPDATA 'io.github.clash-verge-rev.clash-verge-rev\clash.yaml'),
+            (Join-Path $env:USERPROFILE '.config\clash\config.yaml')
         )
-        $ConfigPath = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
     }
-    if (-not $ConfigPath -or -not (Test-Path -LiteralPath $ConfigPath)) { return $null }
-    $yaml = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8 -ErrorAction Stop
-    $address = [regex]::Match($yaml, '(?m)^external-controller:\s*([^\r\n#]+)').Groups[1].Value.Trim().Trim('"').Trim("'")
-    # Never send a controller credential to a nonlocal or unvalidated address.
-    if ($address -notmatch '^(127\.0\.0\.1|localhost|0\.0\.0\.0):([0-9]{1,5})$') { return $null }
-    $port = [int]$Matches[2]
-    if ($port -lt 1 -or $port -gt 65535) { return $null }
-    $secret = [regex]::Match($yaml, '(?m)^secret:[ \t]*([^\r\n]*)').Groups[1].Value.Trim()
-    if ($secret.StartsWith('"')) { $secret = $secret | ConvertFrom-Json }
-    elseif ($secret.StartsWith("'")) { $secret = $secret.Trim("'").Replace("''", "'") }
-    else { $secret = ($secret -replace '\s+#.*$', '').Trim() }
-    return [pscustomobject]@{
-        config_path = [IO.Path]::GetFullPath($ConfigPath)
-        base_uri = ('http://127.0.0.1:' + $port)
-        secret = $secret
+    foreach ($candidate in $candidates) {
+        if (-not $candidate -or -not (Test-Path -LiteralPath $candidate)) { continue }
+        try {
+            $yaml = Get-Content -LiteralPath $candidate -Raw -Encoding UTF8 -ErrorAction Stop
+            $secret = [regex]::Match($yaml, '(?m)^secret:[ \t]*([^\r\n]*)').Groups[1].Value.Trim()
+            if ($secret.StartsWith('"')) { $secret = $secret | ConvertFrom-Json }
+            elseif ($secret.StartsWith("'")) { $secret = $secret.Trim("'").Replace("''", "'") }
+            else { $secret = ($secret -replace '\s+#.*$', '').Trim() }
+            if ($secret -match '[\r\n]') { continue }
+            $endpoints = @()
+            $pipe = [regex]::Match($yaml, '(?m)^external-controller-pipe:[ \t]*([^\r\n]+)').Groups[1].Value.Trim().Trim('"').Trim("'")
+            # Verge service mode replaces the sidecar name at launch. Match only
+            # the same local pipe identity; never open an arbitrary remote pipe.
+            if ($pipe -match '^\\\\\.\\pipe\\(verge-mihomo-[A-Za-z0-9_-]+)$') {
+                $configuredName = $Matches[1]
+                $names = @($configuredName.Replace('verge-mihomo-sidecar-release-', 'verge-mihomo-production-'), $configuredName) | Select-Object -Unique
+                $available = @([IO.Directory]::GetFiles('\\.\pipe\'))
+                foreach ($name in $names) {
+                    if ($available -contains ('\\.\pipe\' + $name)) {
+                        $endpoints += [pscustomobject]@{ config_path = [IO.Path]::GetFullPath($candidate); pipe_name = $name; secret = $secret }
+                    }
+                }
+            }
+            $address = [regex]::Match($yaml, '(?m)^external-controller:[ \t]*([^\r\n#]*)').Groups[1].Value.Trim().Trim('"').Trim("'")
+            # Never send a controller credential to a nonlocal address.
+            if ($address -match '^(127\.0\.0\.1|localhost|0\.0\.0\.0):([0-9]{1,5})$') {
+                $port = [int]$Matches[2]
+                if ($port -ge 1 -and $port -le 65535) {
+                    $endpoints += [pscustomobject]@{ config_path = [IO.Path]::GetFullPath($candidate); base_uri = ('http://127.0.0.1:' + $port); secret = $secret }
+                }
+            }
+            foreach ($endpoint in $endpoints) {
+                try {
+                    $status = Invoke-ClashApi -Controller $endpoint
+                    if ($status.mode) { return $endpoint }
+                } catch { }
+            }
+        } catch { }
+    }
+    return $null
+}
+
+function Invoke-ClashPipeApi($Controller, [string]$Method, $Payload) {
+    $pipe = $null; $reader = $null
+    try {
+        if ($Controller.pipe_name -notmatch '^verge-mihomo-[A-Za-z0-9_-]+$' -or
+            $Method -notin @('GET', 'PATCH') -or $Controller.secret -match '[\r\n]') {
+            throw 'Invalid local Clash request.'
+        }
+        $pipe = [IO.Pipes.NamedPipeClientStream]::new('.', $Controller.pipe_name,
+            [IO.Pipes.PipeDirection]::InOut, [IO.Pipes.PipeOptions]::Asynchronous)
+        $pipe.Connect(2000)
+        $body = ''
+        if ($null -ne $Payload) { $body = $Payload | ConvertTo-Json -Depth 5 -Compress }
+        $bodyBytes = [Text.Encoding]::UTF8.GetBytes($body)
+        # HTTP/1.0 and Connection: close give a bounded, non-chunked response on
+        # both the bundled Mihomo service and its sidecar, on PowerShell 5.1.
+        $header = "$Method /configs HTTP/1.0`r`nHost: localhost`r`nConnection: close`r`n"
+        if ($Controller.secret) { $header += ('Authorization: Bearer ' + $Controller.secret + "`r`n") }
+        $header += "Content-Type: application/json`r`nContent-Length: $($bodyBytes.Length)`r`n`r`n"
+        $headerBytes = [Text.Encoding]::UTF8.GetBytes($header)
+        $write = $pipe.WriteAsync($headerBytes, 0, $headerBytes.Length)
+        if (-not $write.Wait(3000)) { throw 'Local Clash write timed out.' }
+        if ($bodyBytes.Length) {
+            $write = $pipe.WriteAsync($bodyBytes, 0, $bodyBytes.Length)
+            if (-not $write.Wait(3000)) { throw 'Local Clash write timed out.' }
+        }
+        $reader = [IO.StreamReader]::new($pipe, [Text.Encoding]::UTF8)
+        $read = $reader.ReadToEndAsync()
+        if (-not $read.Wait(3000)) { throw 'Local Clash read timed out.' }
+        $parts = $read.Result -split "`r`n`r`n", 2
+        if ($parts.Count -ne 2 -or $parts[0] -notmatch '^HTTP/1\.[01] 2[0-9]{2}\b' -or
+            $parts[0] -match '(?i)Transfer-Encoding:\s*chunked') { throw 'Local Clash request failed.' }
+        if ($parts[1]) { return ($parts[1] | ConvertFrom-Json) }
+    } finally {
+        if ($pipe) { $pipe.Dispose() }
+        if ($reader) { $reader.Dispose() }
     }
 }
 
 function Invoke-ClashApi($Controller, [string]$Method = 'GET', $Payload) {
+    if ($Controller.pipe_name) { return (Invoke-ClashPipeApi -Controller $Controller -Method $Method -Payload $Payload) }
     $request = $null; $response = $null; $reader = $null
     try {
         $request = [Net.HttpWebRequest]::Create($Controller.base_uri + '/configs')
@@ -149,9 +212,33 @@ function Save-AuthNetworkState([string]$StatePath, $State) {
 }
 
 function Test-ClashTunActive {
-    return [bool]@([Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() | Where-Object {
-        $_.Description -match '^Clash Tunnel$|^Mihomo' -and $_.OperationalStatus -eq 'Up'
+    param([object[]]$Interfaces = @([Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()))
+    return [bool]@($Interfaces | Where-Object {
+        $_.Description -match '^(Clash|Meta) Tunnel$|^Mihomo' -and $_.OperationalStatus -eq 'Up'
     }).Count
+}
+
+function Wait-ClashTunInactive {
+    $deadline = (Get-Date).AddSeconds(8)
+    while (Test-ClashTunActive) {
+        if ((Get-Date) -ge $deadline) { throw 'Clash TUN is still active; authentication was not started.' }
+        Start-Sleep -Milliseconds 200
+    }
+}
+
+function Get-AuthenticationLock([int]$TimeoutMs = 0) {
+    $mutex = New-Object Threading.Mutex($false, 'Global\CampusNetAuthenticationMutex')
+    try {
+        try { $owned = $mutex.WaitOne($TimeoutMs) }
+        catch [Threading.AbandonedMutexException] { $owned = $true }
+        if ($owned) { return $mutex }
+    } catch { $mutex.Dispose(); throw }
+    $mutex.Dispose()
+    return $null
+}
+
+function Release-AuthenticationLock($Mutex) {
+    if ($Mutex) { try { $Mutex.ReleaseMutex() } finally { $Mutex.Dispose() } }
 }
 
 function Get-LegacyCfwState($Controller) {
@@ -237,10 +324,17 @@ function Update-AuthNetworkContext([string]$StatePath, [string]$ClashConfigPath 
     }
     if ($state.clash) { $ClashConfigPath = $state.clash.config_path }
     $controller = Get-LocalClashController -ConfigPath $ClashConfigPath
-    if (-not $controller) { return }
+    if (-not $controller) {
+        if (Test-ClashTunActive) { throw 'Active Clash TUN has no reachable local controller; authentication was not started.' }
+        return
+    }
     try { $current = Invoke-ClashApi -Controller $controller }
-    catch { Write-NetworkLog 'Authentication: Clash controller is unavailable; will retry during authentication.'; return }
-    if (-not $current.mode) { return }
+    catch {
+        if (Test-ClashTunActive) { throw 'Active Clash TUN could not be paused; authentication was not started.' }
+        Write-NetworkLog 'Authentication: Clash controller is unavailable; will retry during authentication.'
+        return
+    }
+    if (-not $current.mode) { throw 'Clash controller did not report its state.' }
     if (-not $current.tun) {
         $legacy = Get-LegacyCfwState -Controller $controller
         if ($legacy) {
@@ -255,7 +349,7 @@ function Update-AuthNetworkContext([string]$StatePath, [string]$ClashConfigPath 
     $patch = @{}
     if ($current.mode -ne 'direct') { $patch['mode'] = 'direct' }
     if ($current.tun -and $current.tun.enable -eq $true) { $patch['tun'] = @{ enable = $false } }
-    if ($patch.Count -eq 0) { return }
+    if ($patch.Count -eq 0) { Wait-ClashTunInactive; return }
     if (-not $state.clash) {
         $state.clash = [pscustomobject]@{
             config_path = $controller.config_path
@@ -275,11 +369,15 @@ function Update-AuthNetworkContext([string]$StatePath, [string]$ClashConfigPath 
     if ($verified.mode -ne 'direct' -or ($verified.tun -and $verified.tun.enable -eq $true)) {
         throw 'Clash did not apply the temporary direct settings.'
     }
-    Write-NetworkLog 'Authentication: Clash is temporarily DIRECT (TUN paused when the core supports it).'
+    Wait-ClashTunInactive
+    Clear-DnsClientCache -ErrorAction SilentlyContinue
+    Write-NetworkLog 'Authentication: Clash is temporarily DIRECT; TUN is confirmed inactive.'
 }
 
 function Restore-AuthNetworkContext([string]$StatePath) {
     if (-not (Test-Path -LiteralPath $StatePath)) { return $true }
+    $authLock = Get-AuthenticationLock
+    if (-not $authLock) { return $false }
     try {
         $state = Get-Content -LiteralPath $StatePath -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
         if ($state.version -ne 1) { throw 'Unsupported network recovery journal.' }
@@ -322,5 +420,7 @@ function Restore-AuthNetworkContext([string]$StatePath) {
         # Do not log exceptions containing PAC addresses or controller credentials.
         Write-NetworkLog 'Proxy restoration is pending; the saved settings will be retried.'
         return $false
+    } finally {
+        Release-AuthenticationLock $authLock
     }
 }

@@ -1,4 +1,4 @@
-param([string]$RepoRoot = (Split-Path -Parent $PSScriptRoot))
+﻿param([string]$RepoRoot = (Split-Path -Parent $PSScriptRoot))
 $ErrorActionPreference = 'Stop'
 
 # Import function definitions without running the watchdog or touching the desktop.
