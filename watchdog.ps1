@@ -446,6 +446,11 @@ function Repair-NicAdapter {
 
 function Invoke-CampusRecovery {
     # One bounded cycle; restore proxies on success, failure, or a terminating error.
+    $authLock = Get-AuthenticationLock
+    if (-not $authLock) {
+        Log '另一联网任务正在认证, 本轮等待, 不重启客户端或网卡'
+        return $false
+    }
     try {
         if (-not (Wait-AdapterUp -TimeoutSec 45)) {
             Log '物理网卡尚未就绪, 等待有效 IPv4 后重试, 本轮不重启客户端'
@@ -492,6 +497,7 @@ function Invoke-CampusRecovery {
         if (-not (Restore-AuthNetworkContext -StatePath $NetworkStatePath)) {
             Log '代理恢复尚未完成, 下轮优先重试恢复原设置'
         }
+        Release-AuthenticationLock $authLock
     }
 }
 
@@ -499,7 +505,9 @@ function Invoke-ReconnectSelfTest([string]$Id, [datetime]$Deadline) {
     $report = [ordered]@{ id = $Id; deadline = $Deadline.ToString('o'); passed = $false;
         tun_stopped = $false; disconnected = $false; restored = $false }
     $reportPath = Join-Path $LogDir ('reconnect-test-' + $Id + '.json')
+    $authLock = Get-AuthenticationLock
     try {
+        if (-not $authLock) { throw 'Another authentication is in progress.' }
         $script:RecoveryDeadline = $Deadline
         if ((Get-Date) -ge $Deadline) { throw 'Deadline reached before test start.' }
         if (-not (Test-Internet)) { throw 'Initial network is offline.' }
@@ -538,7 +546,10 @@ function Invoke-ReconnectSelfTest([string]$Id, [datetime]$Deadline) {
         Log ('限时重测未通过: ' + $_.Exception.GetType().Name)
     } finally {
         $script:RecoveryDeadline = $null
-        $report.restored = Restore-AuthNetworkContext -StatePath $NetworkStatePath
+        if ($authLock) {
+            $report.restored = Restore-AuthNetworkContext -StatePath $NetworkStatePath
+            Release-AuthenticationLock $authLock
+        }
         $report.finished = (Get-Date).ToString('o')
         [IO.File]::WriteAllText($reportPath, ($report | ConvertTo-Json), (New-Object Text.UTF8Encoding($false)))
     }
@@ -681,7 +692,7 @@ if (-not $ownsMutex) {
 }
 
 # ---------- 主循环 ----------
-Log '===== 校园网看门狗启动 v1.4.0 ====='
+Log '===== 校园网看门狗启动 v1.5.0 (Clash Verge / Meta) ====='
 $fails = 0
 $lastBounce = Get-Date '2000-01-01'
 $awayMode = $false

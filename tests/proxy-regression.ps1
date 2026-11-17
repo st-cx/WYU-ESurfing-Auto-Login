@@ -1,4 +1,4 @@
-param([string]$RepoRoot = (Split-Path -Parent $PSScriptRoot))
+﻿param([string]$RepoRoot = (Split-Path -Parent $PSScriptRoot))
 $ErrorActionPreference = 'Stop'
 . (Join-Path $RepoRoot 'network.ps1')
 $testDir = Join-Path ([IO.Path]::GetTempPath()) ('campus-proxy-test-' + [guid]::NewGuid().ToString('N'))
@@ -22,6 +22,8 @@ function Set-SystemProxyValue([string]$Name, $Value, [bool]$Exists = $true) {
     $script:proxy[$Name] = @{ exists = $Exists; value = $Value }
 }
 function Notify-SystemProxyChanged {}
+function Clear-DnsClientCache {}
+function Test-ClashTunActive { return ($script:legacyActive -or [bool]($script:clash.tun -and $script:clash.tun.enable)) }
 function Get-LocalClashController([string]$ConfigPath) {
     if (-not $script:controllerAvailable) { return $null }
     return [pscustomobject]@{ config_path = 'fixture.yaml'; base_uri = 'http://127.0.0.1:1'; secret = 'private-do-not-persist' }
@@ -93,6 +95,15 @@ try {
     Assert-True (Restore-AuthNetworkContext -StatePath $statePath) 'Legacy CFW restoration failed.'
     Assert-True $script:legacyActive 'Legacy CFW and its TUN must be restored after authentication.'
     Write-Output 'PASS: legacy CFW really stops TUN before login and restores it afterwards.'
+
+    $script:legacyActive = $true; $script:controllerAvailable = $false
+    $blocked = $false
+    try { Enter-AuthNetworkContext -StatePath $statePath }
+    catch { $blocked = $_.Exception.Message -match 'no reachable local controller' }
+    Assert-True $blocked 'An active TUN without a controller must abort authentication.'
+    Assert-True (Restore-AuthNetworkContext -StatePath $statePath) 'A blocked attempt must restore its proxy/PAC changes.'
+    Assert-True ($script:proxy.ProxyEnable.value -eq 1) 'A blocked attempt left the system proxy disabled.'
+    Write-Output 'PASS: an uncontrollable active TUN aborts authentication and preserves restoration.'
 } finally {
     Remove-Item -LiteralPath $statePath -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $testDir -Force -ErrorAction SilentlyContinue
