@@ -43,9 +43,10 @@ function Start-ScheduledTask {
 }
 $root=Join-Path ([IO.Path]::GetTempPath()) ('campus-update-test-'+[guid]::NewGuid().ToString('N'))
 $script:CampusAuthMutexName='Local\'+[IO.Path]::GetFileName($root)
-$script:packageVersion='1.6.3'
+$script:packageVersion='1.7.0'
 $files=Get-CampusProgramFiles
 Assert ($files -notcontains 'default-account.txt') 'A release may not supply a personal default account.'
+Assert ($files -notcontains 'campus-settings.json' -and $files -contains 'tools\settings.ps1' -and $files -contains 'settings-store.ps1') 'The updater must ship the account settings UI and preserve local preferences.'
 try {
     $untyped=New-CimInstance -ClientOnly -ClassName MSFT_TaskEventTrigger -Namespace 'Root/Microsoft/Windows/TaskScheduler'
     $rejected=$false
@@ -88,11 +89,7 @@ try {
         } else {
             if($failure){throw $failure}
             Assert ((Get-FileHash $watch).Hash -eq (Get-FileHash (Join-Path $RepoRoot 'watchdog.ps1')).Hash) 'The installed worker is not the package version.'
-            if ($case -eq 'custom-companion') {
-                Assert ([IO.File]::ReadAllText($auto) -ceq $oldAuto -and $report.Warning) 'Custom companion was overwritten or not reported.'
-            } else {
-                Assert ([IO.File]::ReadAllText($auto).Contains('Invoke-SingleConnection')) 'The second logon entry point was not upgraded.'
-            }
+            Assert ([IO.File]::ReadAllText($auto) -ceq $oldAuto) 'The public updater changed a separate login tool.'
             foreach ($name in $files) {
                 Assert ((Get-FileHash -LiteralPath (Join-Path $script:destination $name)).Hash -eq (Get-FileHash -LiteralPath (Join-Path $RepoRoot $name)).Hash) ('Package file differs after update: '+$name)
             }

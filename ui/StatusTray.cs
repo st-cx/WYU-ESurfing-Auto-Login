@@ -154,32 +154,6 @@ namespace CampusRecovery {
         }
     }
 
-    internal sealed class TrayField : Panel {
-        internal readonly TextBox Edit;
-        readonly TrayTheme theme;
-        readonly int inset;
-        internal TrayField(TrayTheme theme, Font nativeFont, int inset, string name, bool password) {
-            this.theme = theme; this.inset = inset; BackColor = theme.Surface;
-            SetStyle(ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw,true);
-            Edit = new TextBox { Font=nativeFont, BorderStyle=BorderStyle.None, MaxLength=password ? 160 : 16,
-                UseSystemPasswordChar=password, AccessibleName=name, BackColor=theme.Surface, ForeColor=theme.Text };
-            Edit.GotFocus += delegate { Invalidate(); }; Edit.LostFocus += delegate { Invalidate(); };
-            Controls.Add(Edit);
-        }
-        protected override void OnSizeChanged(EventArgs e) {
-            base.OnSizeChanged(e);
-            if (Edit != null) {
-                int h = Edit.PreferredHeight;
-                Edit.SetBounds(inset,Math.Max(0,(Height-h)/2),Math.Max(1,Width-2*inset),h);
-            }
-        }
-        protected override void OnPaint(PaintEventArgs e) {
-            base.OnPaint(e); e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-            using (var border = new Pen(Edit.Focused ? theme.Accent : theme.Border,Edit.Focused ? 2 : 1))
-            using (var shape = TrayArt.Round(new RectangleF(1,1,Width-2,Height-2),inset/2f)) e.Graphics.DrawPath(border,shape);
-        }
-    }
-
     internal class TrayCard : Form {
         internal const TextFormatFlags Wrap = TextFormatFlags.WordBreak | TextFormatFlags.NoPrefix | TextFormatFlags.TextBoxControl;
         internal readonly Rectangle WorkArea;
@@ -238,23 +212,12 @@ namespace CampusRecovery {
             var font = new Font(SystemFonts.MessageBoxFont.FontFamily, points, style, GraphicsUnit.Point);
             ownedFonts.Add(font); return font;
         }
-        protected TextBox AddInput(string name, bool password) {
-            // The native single-line EDIT uses its HFONT directly, unlike the GDI-drawn labels.
-            var font = new Font(bodyFont.FontFamily,15f*DisplayDpi/96f*textFactor,FontStyle.Regular,GraphicsUnit.Pixel);
-            ownedFonts.Add(font);
-            var field = new TrayField(Theme,font,Px(10),name,password);
-            AddRow(field,4); return field.Edit;
-        }
         static Label LabelFor(string text, Font font, Color ink) {
             return new Label { Text = text, Font = font, ForeColor = ink, UseMnemonic = false,
                 AutoEllipsis = false, AutoSize = false, UseCompatibleTextRendering = false };
         }
         internal Label AddText(string text, int gap) {
             var label = LabelFor(text,bodyFont,Theme.Muted); AddRow(label,gap); return label;
-        }
-        internal TrayButton AddAction(string text, bool primary, int gap) {
-            var button = new TrayButton(text,Theme,primary,false) { Font = bodyFont };
-            AddRow(button,gap); return button;
         }
         protected void AddRow(Control control, int gap) {
             control.Margin = new Padding(0,Px(gap),0,0); control.TabIndex = Rows.Controls.Count;
@@ -272,13 +235,6 @@ namespace CampusRecovery {
                 int h;
                 var label = row as Label;
                 if (label != null) h = TextHeight(label,width);
-                else if (row is Button) {
-                    int inset = Math.Max(Px(12), row.Font.Height);
-                    int text = TextRenderer.MeasureText(row.Text,row.Font,new Size(Math.Max(1,width-2*inset),Int32.MaxValue),Wrap).Height;
-                    h = Math.Max(Px(37),text + Px(12));
-                } else if (row is TrayField) {
-                    h = Math.Max(Px(37),((TrayField)row).Edit.PreferredHeight+Px(10));
-                }
                 else h = row.Height;
                 row.SetBounds(0,y,width,h); y += h;
             }
@@ -336,93 +292,6 @@ namespace CampusRecovery {
         }
     }
 
-    internal sealed class AccountCard : TrayCard {
-        readonly string primary;
-        readonly Label countdown;
-        readonly Panel progress = new Panel();
-        readonly Stopwatch elapsed = new Stopwatch();
-        readonly System.Windows.Forms.Timer tick = new System.Windows.Forms.Timer();
-        int remaining = -1;
-        internal string Selected { get; private set; }
-        internal AccountCard(Rectangle area, int dpi, string primary, string[] others)
-            : base(area,dpi,TrayTone.Account,"选择登录账号",false,false) {
-            this.primary = Selected = primary;
-            countdown = AddText("10 秒后自动使用默认账号",0);
-            progress.Height = Math.Max(2,Px(3)); AddRow(progress,7);
-            progress.Paint += delegate(object sender, PaintEventArgs e) {
-                e.Graphics.Clear(Theme.Soft);
-                using (var brush = new SolidBrush(Theme.Accent)) {
-                    double fraction = Math.Max(0,1-elapsed.Elapsed.TotalSeconds/10);
-                    e.Graphics.FillRectangle(brush,0,0,(int)Math.Ceiling(progress.Width*fraction),progress.Height);
-                }
-            };
-            var usePrimary = AddAction("使用默认账号  " + primary,true,13);
-            usePrimary.Click += delegate { Close(); }; AcceptButton = usePrimary;
-            if (others != null && others.Length > 0) {
-                foreach (string id in others) {
-                    string choice = id;
-                    var useAlternate = AddAction("备用账号  " + choice,false,7);
-                    useAlternate.Click += delegate { Pick(choice); };
-                }
-            } else {
-                var add = AddAction("使用其他账号…",false,7);
-                add.Click += delegate { Pick("@add"); };
-            }
-            tick.Interval = 120;
-            tick.Tick += delegate {
-                int left = Math.Max(0,10-(int)elapsed.Elapsed.TotalSeconds);
-                if (remaining != left) { countdown.Text = left + " 秒后自动使用默认账号"; remaining = left; }
-                progress.Invalidate();
-                if (elapsed.ElapsedMilliseconds >= 10000) Close();
-            };
-            Shown += delegate { elapsed.Start(); tick.Start(); };
-            Fit();
-        }
-        void Pick(string choice) {
-            Selected = StatusTray.SelectBeforeTimeout(primary,choice,elapsed.IsRunning ? elapsed.ElapsedMilliseconds : -1);
-            Close();
-        }
-        protected override void Dispose(bool disposing) {
-            if (disposing) tick.Dispose(); base.Dispose(disposing);
-        }
-    }
-
-    internal sealed class AlternateCard : TrayCard {
-        readonly TextBox userBox, passwordBox;
-        readonly Label hint;
-        readonly System.Windows.Forms.Timer timeout = new System.Windows.Forms.Timer();
-        internal StatusTray.SavedInput Result { get; private set; }
-        internal AlternateCard(Rectangle area, int dpi, string primary)
-            : base(area,dpi,TrayTone.Account,"使用备用账号",true,false) {
-            AddText("校园账号",0);
-            userBox = AddInput("校园账号",false); AddText("密码",10);
-            passwordBox = AddInput("密码",true);
-            hint = AddText("密码由当前 Windows 账号加密保存在本机。",10);
-            var save = AddAction("保存并在本次使用",true,12);
-            var cancel = AddAction("用默认账号",false,7);
-            save.Click += delegate {
-                string id = userBox.Text.Trim();
-                bool valid = id.Length >= 6 && id.Length <= 16 && id != primary;
-                foreach (char c in id) if (c < '0' || c > '9') valid = false;
-                if (!valid || passwordBox.TextLength == 0) {
-                    hint.Text = "请输入另一个校园账号和对应的密码。";
-                    hint.ForeColor = new TrayTheme(TrayTone.Error).Accent; Fit(); return;
-                }
-                var secret = new System.Security.SecureString();
-                foreach (char c in passwordBox.Text) secret.AppendChar(c);
-                secret.MakeReadOnly(); Result = new StatusTray.SavedInput { User = id, Password = secret };
-                passwordBox.Clear(); Close();
-            };
-            cancel.Click += delegate { Close(); }; AcceptButton = save; CancelButton = cancel;
-            timeout.Interval = 60000; timeout.Tick += delegate { Close(); };
-            Shown += delegate { userBox.Focus(); timeout.Start(); }; Fit();
-        }
-        protected override void Dispose(bool disposing) {
-            if (disposing) { timeout.Dispose(); if (!passwordBox.IsDisposed) passwordBox.Clear(); }
-            base.Dispose(disposing);
-        }
-    }
-
     public static class StatusTray {
         static readonly AutoResetEvent WakeEvent = new AutoResetEvent(false);
         static readonly ManualResetEvent TrayReady = new ManualResetEvent(false);
@@ -449,52 +318,6 @@ namespace CampusRecovery {
             return TrayReady.WaitOne(5000);
         }
 
-        public sealed class SavedInput {
-            public string User;
-            public System.Security.SecureString Password;
-        }
-        public static SavedInput EnterAlternate(string primary) {
-            using (new LoginScreen.DpiScope()) {
-                var area = Screen.FromPoint(Cursor.Position).WorkingArea;
-                using (var form = new AlternateCard(area,TrayArt.Dpi(area),primary)) { form.ShowDialog(); return form.Result; }
-            }
-        }
-        public static string SelectBeforeTimeout(string primary, string candidate, long elapsedMs) {
-            return !String.IsNullOrEmpty(candidate) && elapsedMs >= 0 && elapsedMs < 10000 ? candidate : primary;
-        }
-        public static string ChooseAccount(string primary, string[] alternate) {
-            if (String.IsNullOrEmpty(primary) || !Environment.UserInteractive) return primary;
-            string selected = primary; Form visible = null; int expired = 0; long shownAt = 0;
-            var startup = Stopwatch.StartNew();
-            var thread = new Thread(delegate() {
-                try {
-                    using (new LoginScreen.DpiScope()) {
-                        var area = Screen.PrimaryScreen.WorkingArea;
-                        using (var form = new AccountCard(area,TrayArt.Dpi(area),primary,alternate)) {
-                            visible = form;
-                            form.Shown += delegate {
-                                if (Interlocked.CompareExchange(ref expired,0,0) != 0) { form.Close(); return; }
-                                Interlocked.Exchange(ref shownAt,Stopwatch.GetTimestamp());
-                            };
-                            form.ShowDialog(); selected = form.Selected;
-                        }
-                    }
-                } catch (Exception e) { Trace.WriteLine(e); }
-            });
-            thread.IsBackground = true; thread.SetApartmentState(ApartmentState.STA); thread.Start();
-            while (!thread.Join(100)) {
-                long started = Interlocked.Read(ref shownAt);
-                bool late = started == 0 ? startup.ElapsedMilliseconds > 3500 :
-                    (Stopwatch.GetTimestamp()-started) / (double)Stopwatch.Frequency > 11.5;
-                if (late) {
-                    Interlocked.Exchange(ref expired,1);
-                    try { if (visible != null && visible.IsHandleCreated) visible.BeginInvoke(new Action(visible.Close)); }
-                    catch (InvalidOperationException) {} return primary;
-                }
-            }
-            return selected;
-        }
-
         internal static TrayTone Describe(string phase, out string title) {
             switch (phase) {
                 case "online": title = "已连接"; return TrayTone.Online;
@@ -516,9 +339,25 @@ namespace CampusRecovery {
             card.AddText(detail,0); card.Fit(); return card;
         }
 
+        internal static ContextMenuStrip MakeSettingsMenu(Action<bool> open) {
+            var menu = new ContextMenuStrip { ShowImageMargin = false };
+            menu.Items.Add("添加账号…",null,delegate { open(true); }).Name = "AddAccount";
+            menu.Items.Add("账号与设置…",null,delegate { open(false); }).Name = "Settings";
+            return menu;
+        }
+        internal static ProcessStartInfo SettingsStartInfo(string statusFile, bool add) {
+            string root = Path.GetDirectoryName(Path.GetFullPath(statusFile));
+            string script = Path.Combine(root,@"tools\settings.ps1");
+            string ps = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System),@"WindowsPowerShell\v1.0\powershell.exe");
+            return new ProcessStartInfo(ps,"-NoLogo -NoProfile -STA -ExecutionPolicy Bypass -File \""+script+"\""+(add ? " -AddAccount" : "")) {
+                UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = root
+            };
+        }
+
         sealed class TrayContext : ApplicationContext {
-            readonly string path, prompt;
+            readonly string path;
             readonly NotifyIcon icon = new NotifyIcon();
+            readonly ContextMenuStrip menu;
             readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
             Icon image;
             TrayCard panel;
@@ -527,14 +366,30 @@ namespace CampusRecovery {
             bool pinned;
             DateTime hideAt;
             internal TrayContext(string file) {
-                path = file; prompt = Path.Combine(Path.GetDirectoryName(path),"account-prompt-open.txt");
+                path = file;
+                menu = MakeSettingsMenu(OpenSettings);
+                menu.Opening += delegate { HidePanel(); };
+                icon.ContextMenuStrip = menu;
                 UpdateIcon(); icon.Visible = true;
-                icon.MouseClick += delegate {
+                icon.MouseClick += delegate(object sender, MouseEventArgs e) {
+                    if (e.Button != MouseButtons.Left) return;
                     if (pinned && panel != null && panel.Visible) { HidePanel(); return; }
                     pinned = true;
                     Open(Screen.FromPoint(Cursor.Position).WorkingArea,true);
                 };
                 timer.Interval = 450; timer.Tick += delegate { Poll(); }; timer.Start();
+            }
+            void OpenSettings(bool add) {
+                try {
+                    var command = SettingsStartInfo(path,add);
+                    if (!File.Exists(Path.Combine(command.WorkingDirectory,@"tools\settings.ps1")))
+                        throw new FileNotFoundException();
+                    using (var process = Process.Start(command)) { }
+                } catch (Exception error) {
+                    Trace.WriteLine(error);
+                    MessageBox.Show("无法打开设置，请使用完整安装包中的「校园网设置.cmd」，或重新安装校园网工具。",
+                        "校园网设置",MessageBoxButtons.OK,MessageBoxIcon.Warning);
+                }
             }
             void UpdateIcon() {
                 string title; var tone = Describe(phase,out title);
@@ -555,9 +410,6 @@ namespace CampusRecovery {
             }
             internal void Poll() {
                 try {
-                    if (File.Exists(prompt) && (DateTime.UtcNow-File.GetLastWriteTimeUtc(prompt)).TotalSeconds < 14) {
-                        if (panel != null && panel.Visible) panel.Hide(); return;
-                    }
                     string body = File.ReadAllText(path,Encoding.UTF8);
                     int split = body.IndexOf('\n');
                     if (split >= 0 && body != snapshot) {
@@ -575,7 +427,7 @@ namespace CampusRecovery {
             }
             protected override void Dispose(bool disposing) {
                 if (disposing) {
-                    timer.Dispose(); icon.Visible = false; icon.Dispose(); if (image != null) image.Dispose();
+                    timer.Dispose(); icon.Visible = false; icon.Dispose(); menu.Dispose(); if (image != null) image.Dispose();
                     if (panel != null) panel.Dispose();
                 }
                 base.Dispose(disposing);

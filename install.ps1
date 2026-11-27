@@ -14,7 +14,7 @@
 param(
     [switch]$DryRun,      # 只探测并打印结果, 不安装
     [switch]$Uninstall,   # 卸载
-    [switch]$NoCalibrate  # 安装后不提示校准 (无人值守场景)
+    [switch]$NoCalibrate  # 兼容原有无人值守安装调用，多个网卡时采用自动选择
 )
 
 $ErrorActionPreference = 'Stop'
@@ -72,10 +72,14 @@ function Find-ClientDir {
     return $null
 }
 
-function Find-Adapter {
+function Get-InstallAdapters {
     $skip = 'Hyper-V|VMware|Virtual|Loopback|TAP|VPN|Bluetooth|WAN Miniport|Kernel Debug|Clash|Mihomo|TUN|Tailscale|WireGuard'
-    $cands = @(Get-NetAdapter -ErrorAction SilentlyContinue |
-        Where-Object { $_.Status -eq 'Up' -and $_.InterfaceDescription -notmatch $skip })
+    Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
+        Where-Object { $_.Status -eq 'Up' -and $_.InterfaceDescription -notmatch $skip }
+}
+
+function Find-Adapter {
+    $cands = @(Get-InstallAdapters)
     if ($cands.Count -eq 0) { return $null }
     $wired = @($cands | Where-Object { $_.MediaType -eq '802.3' })
     $pool = $cands
@@ -106,8 +110,10 @@ if ($Uninstall) {
         if ($task) { Stop-ScheduledTask -TaskName $TaskName -ErrorAction Stop }
         $networkState = Join-Path $installDir 'proxy-recovery.json'
         $otherState = Join-Path ([IO.Path]::GetDirectoryName($companion)) 'proxy-recovery.json'
-        if (-not (Restore-AuthNetworkContext $networkState) -or -not (Restore-AuthNetworkContext $otherState)) {
-            throw '代理尚未恢复, 已保留安装目录。请启动 Clash 后重试卸载。'
+        foreach ($pending in @($networkState,$otherState)) {
+            if ([IO.File]::Exists($pending) -and -not (Restore-AuthNetworkContext $pending)) {
+                throw '上次认证留下的代理设置尚未恢复，请检查原代理软件后重试卸载。'
+            }
         }
         if ([IO.File]::Exists($companion)) {
             $original = $null
@@ -149,7 +155,7 @@ if ($useSavedConfig) {
     $clientDir = Find-ClientDir
     if (-not $clientDir) {
         Warn '未能自动找到客户端 (需要 ESurfingClient.exe 所在目录)'
-        Warn '请先安装并登录一次 "天翼校园客户端", 然后重新运行本安装程序'
+        Warn '请先安装学校使用的天翼校园 Windows 客户端，再运行本安装程序。'
         $clientDir = Read-Host '也可手动输入客户端安装目录 (直接回车取消)'
         if (-not $clientDir) { exit 1 }
         $clientDir = $clientDir.Trim().Trim('"')
@@ -168,7 +174,7 @@ if ($useSavedConfig) {
         if (-not $adapterName) { exit 1 }
         $adapterName = $adapterName.Trim()
     }
-    $upAdapters = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' })
+    $upAdapters = @(Get-InstallAdapters)
     if ($upAdapters.Count -gt 1 -and -not $NoCalibrate) {
         Write-Host '检测到多个在用网卡:'
         for ($i = 0; $i -lt $upAdapters.Count; $i++) {
@@ -316,18 +322,6 @@ try {
     if ($t -and $t.State -eq 'Running') { Ok ('计划任务状态: ' + $t.State) }
     else { throw '计划任务未保持运行, 请检查日志后重新安装' }
 
-    $edit = Get-CompanionEdit $companion
-    if ($edit.Warning) { Warn $edit.Warning }
-    if ($edit.Updated) {
-        try {
-            Initialize-CampusNative
-            $backup = Join-Path $installDir ('backups\'+[guid]::NewGuid().ToString('N')+'\campus-auth.ps1')
-            [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($backup))
-            [IO.File]::Copy($companion,$backup)
-            if ((Read-CompanionScript $companion) -cne $edit.Original) { throw '开机认证入口在安装期间发生变化。请重试。' }
-            Write-CompanionScript $companion $edit.Updated
-        } catch { Warn ('看门狗已启动，未更新可选的 CampusNetAuto 入口：'+$_.Exception.Message) }
-    }
 } finally { Release-AuthenticationLock $lock }
 
 $log = Join-Path $installDir 'logs\watchdog.log'
@@ -337,33 +331,7 @@ if (Test-Path $log) {
 }
 
 Write-Host ''
-Ok '安装完成! 现在起会自动监测断网并自动登录, 无需再手动点登录。'
-
-# ---------- 首次使用引导: 真实点击校准 ----------
-if (-not $NoCalibrate) {
-    Write-Host ''
-    Write-Host '------------------------------------------------------------' -ForegroundColor Cyan
-    Write-Host ' 是否现在做一次"登录按钮校准"? (推荐, 约 1 分钟)' -ForegroundColor Yellow
-    Write-Host ' 校准过程: 工具帮你断开网络 -> 你手动点击一次客户端上的【登 录】'
-    Write-Host '           -> 工具自动记录这次真实点击的位置并验证'
-    Write-Host ' 作用: 适配你这台电脑的窗口尺寸/缩放, 保证断网后能自动点中按钮。'
-    Write-Host ' 跳过也没关系: 以后随时双击安装目录里的 校准按钮坐标.bat 重做。' -ForegroundColor DarkGray
-    Write-Host '------------------------------------------------------------' -ForegroundColor Cyan
-    $ans = Read-Host '现在校准? [Y/n]'
-    if (-not $ans -or ($ans -match '^[Yy]')) {
-        $calibScript = Join-Path $installDir 'tools\calibrate.ps1'
-        if (Test-Path $calibScript) {
-            & $calibScript
-        } else {
-            Warn '未找到校准脚本, 可稍后双击 校准按钮坐标.bat'
-        }
-    } else {
-        Info '已跳过校准, 之后可随时双击 校准按钮坐标.bat 校准'
-    }
-}
-
-Write-Host ''
-Info ('日志目录: ' + (Join-Path $installDir 'logs'))
-Info '常用命令: 在本目录放 command.txt 写 status / bounce / disconnect / shot / click x y'
-Info ('重新校准: 双击 ' + (Join-Path $installDir '校准按钮坐标.bat'))
-Info '卸载: 双击同目录 "卸载.bat"'
+Ok '安装完成。校园网工具已启动。'
+Info '天翼已记住账号时可以直接使用。需要保存账号和密码，请右键托盘图标选择“添加账号”。'
+Info '代理联动默认关闭，需要时可在“账号与设置”中开启。'
+Info '天翼按钮识别异常时，可单独运行“校准按钮坐标.bat”。'

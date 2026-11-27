@@ -26,7 +26,8 @@ try {
     & $compiler /nologo /target:winexe /platform:anycpu /optimize+ /utf8output /codepage:65001 ('/out:' + $staged) ('/resource:' + $payload + ',CampusNet.Payload') /r:System.Windows.Forms.dll /r:System.IO.Compression.dll (Join-Path $PSScriptRoot 'UpdateLauncher.cs')
     if ($LASTEXITCODE -ne 0 -or -not [IO.File]::Exists($staged)) { throw '更新程序编译失败。' }
     if ($CommandPath) {
-        $templatePath = Join-Path $root 'CampusNet-Update-1.6.3.cmd'
+        $version = [version][Diagnostics.FileVersionInfo]::GetVersionInfo($staged).FileVersion
+        $templatePath = Join-Path $root ('CampusNet-Update-' + $version.ToString(3) + '.cmd')
         $cmd = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($CommandPath)
         if ($cmd -ieq $templatePath -or $cmd -ieq $out) { throw '请为独立 CMD 指定单独的输出路径。' }
         $cmdDir = [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($cmd))

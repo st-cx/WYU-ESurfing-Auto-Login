@@ -64,7 +64,6 @@ $Config = [ordered]@{
     client_start_wait_sec   = 12
     login_ready_timeout_sec = 100
     auth_settle_wait_sec    = 75
-    proxy_guard             = $true
     clash_config_path       = ''
     http_probe_targets      = @(
         @{ url = 'http://connect.rom.miui.com/generate_204'; status = 204; body = '' },
@@ -104,6 +103,7 @@ $LoginReadyTimeout = [Math]::Max(10,[int]$Config.login_ready_timeout_sec)
 $AuthSettleWaitSec  = [int]$Config.auth_settle_wait_sec
 $HttpProbeTargets   = $Config.http_probe_targets
 . (Join-Path $Root 'network.ps1')
+. (Join-Path $Root 'settings-store.ps1')
 . (Join-Path $Root 'monitor.ps1')
 $NetworkStatePath   = Join-Path $Root 'proxy-recovery.json'
 $AutoNetworkStatePath = Join-Path $env:USERPROFILE 'CampusNetAuto\proxy-recovery.json'
@@ -324,16 +324,22 @@ function Test-SameLoginSample($First,$Second) {
 
 function Update-LoginGuard {
     if (Test-Path -LiteralPath $NetworkStatePath) {
-        Update-AuthNetworkContext -StatePath $NetworkStatePath -ClashConfigPath $Config.clash_config_path
+        if ($script:CampusPreferences.ProxyEnabled) {
+            Update-AuthNetworkContext -StatePath $NetworkStatePath -ClashConfigPath $Config.clash_config_path
+        } elseif (-not (Restore-AuthNetworkContext $NetworkStatePath)) { throw '上次认证的网络设置仍待恢复。' }
     }
 }
 
 function Send-RecognizedLogin($Sample,[bool]$Physical) {
-    $tag = if ($Physical) { 'pre-click' } else { 'pre-bgclick' }
-    Save-WindowShot $Sample.Window $tag
+    $expected = $script:CampusPreferences.DefaultAccount
+    if (-not (Update-CampusPreferences)) { $script:accountPending=$true; return $false }
+    if ($expected -cne $script:CampusPreferences.DefaultAccount) {
+        $script:accountPending=$true
+        Set-CampusStatus 'account' '默认账号已更改，正在重新核对天翼登录表单'
+        return $false
+    }
     if ($Sample.Window -notin @(Get-CampusWindows)) { return $false }
-    if ($script:CampusAccountUser -and -not [CampusRecovery.LoginScreen]::CheckAccount($Sample.Window,$script:LoginGlyph,$script:LoginX,$script:LoginY,$script:CampusAccountUser,$true)) { return $false }
-    if (-not [CampusRecovery.LoginScreen]::ClickVerified($Sample.Window,$script:LoginGlyph,$script:LoginX,$script:LoginY,$Physical)) { return $false }
+    if (-not [CampusRecovery.LoginScreen]::ClickVerified($Sample.Window,$script:LoginGlyph,$script:LoginX,$script:LoginY,$Physical,[string]$expected)) { return $false }
     $script:submittedWindow = $Sample.Window
     return $true
 }
@@ -372,15 +378,16 @@ function Invoke-LoginClick([scriptblock]$BeforeLogin) {
         }
         if (Test-SameLoginSample $previous $sample) {
             Set-CampusStatus 'ready' '已识别到登录按钮，正在提交认证'
-            if ($script:CampusAccountUser) {
-                if (-not (Confirm-CampusAccount $sample)) { $script:accountPending=$true; return 'AccountPending' }
-            } elseif ($BeforeLogin) { & $BeforeLogin | Out-Null; $BeforeLogin = $null }
+            if (-not (Update-CampusPreferences) -or -not (Confirm-CampusAccount $sample)) {
+                $script:accountPending=$true; return 'AccountPending'
+            }
             Update-LoginGuard
             if (Test-Internet) { return 'Online' }
             if (Send-RecognizedLogin $sample $false) {
                 Set-CampusStatus 'auth' '已点击登录，等待天翼认证并核验外网'
                 return 'Submitted'
             }
+            if ($script:accountPending) { return 'AccountPending' }
             Set-CampusStatus 'loading' '天翼界面已变化，正在重新识别'
             $sample = $null
         }
@@ -403,10 +410,14 @@ function Wait-AuthSettle {
         if ([datetime]::UtcNow -ge $retryAt) {
             $sample = Get-LoginSample
             if (Test-SameLoginSample $previous $sample) {
-                if ((Confirm-CampusAccount $sample) -and (Send-RecognizedLogin $sample $true)) {
+                if (-not (Update-CampusPreferences) -or -not (Confirm-CampusAccount $sample)) {
+                    $script:accountPending=$true; return $false
+                }
+                if (Send-RecognizedLogin $sample $true) {
                     Set-CampusStatus 'auth' '天翼仍显示登录按钮，已重新提交，等待认证'
                     $retryAt = [datetime]::MaxValue
                 }
+                if ($script:accountPending) { return $false }
             }
             $previous = $sample
         }
@@ -490,8 +501,10 @@ function Invoke-CampusRecovery([switch]$RepairProxy,[scriptblock]$BeforeLogin) {
     $script:submittedWindow = [intptr]::Zero
     try {
         if (-not (Restore-AuthNetworkContext $AutoNetworkStatePath)) { return $false }
+        if (-not (Update-CampusPreferences)) { return $false }
+        if (-not $script:CampusPreferences.ProxyEnabled -and -not (Restore-AuthNetworkContext $NetworkStatePath)) { return $false }
         if (-not (Wait-AdapterUp -TimeoutSec 45)) { return $false }
-        if ($Config.proxy_guard) {
+        if ($script:CampusPreferences.ProxyEnabled) {
             if (Test-Path -LiteralPath $NetworkStatePath) {
                 Update-AuthNetworkContext $NetworkStatePath $Config.clash_config_path
             } else { Enter-AuthNetworkContext $NetworkStatePath $Config.clash_config_path -RepairProxy:$RepairProxy }
@@ -512,7 +525,7 @@ function Invoke-CampusRecovery([switch]$RepairProxy,[scriptblock]$BeforeLogin) {
             Restart-Client -ForceRestart:($stage -eq 2 -or $script:retryClient)
             $script:retryClient = $false
             Update-LoginGuard
-            $result = Invoke-LoginClick -BeforeLogin $BeforeLogin
+            $result = Invoke-LoginClick
             if ($result -eq 'Timeout') {
                 $script:retryClient = $script:lastLoginRead -in @('no-window','no-glyph')
                 if ($script:lastLoginRead -eq 'no-glyph') {
@@ -530,10 +543,11 @@ function Invoke-CampusRecovery([switch]$RepairProxy,[scriptblock]$BeforeLogin) {
                 }
                 return $true
             }
+            if ($script:accountPending) { return $false }
         }
         return $false
     } catch {
-        Log ('恢复中断，准备恢复代理：'+$_.Exception.GetType().Name)
+        Log ('校园网恢复中断：'+$_.Exception.GetType().Name)
         return $false
     } finally {
         try { [void](Restore-AuthNetworkContext $NetworkStatePath) }
@@ -543,20 +557,27 @@ function Invoke-CampusRecovery([switch]$RepairProxy,[scriptblock]$BeforeLogin) {
 
 function Invoke-ReconnectSelfTest([string]$Id, [datetime]$Deadline) {
     $report = [ordered]@{ id = $Id; deadline = $Deadline.ToString('o'); passed = $false;
-        tun_stopped = $false; disconnected = $false; restored = $false }
+        proxy_managed = $false; tun_stopped = $null; disconnected = $false; restored = $false }
     $reportPath = Join-Path $LogDir ('reconnect-test-' + $Id + '.json')
     $authLock = Get-AuthenticationLock
     try {
         if (-not $authLock) { throw 'Another authentication is in progress.' }
         $script:RecoveryDeadline = $Deadline
         if ((Get-Date) -ge $Deadline) { throw 'Deadline reached before test start.' }
+        if (-not (Restore-AuthNetworkContext $NetworkStatePath) -or -not (Restore-AuthNetworkContext $AutoNetworkStatePath)) { throw 'Prior network restoration is pending.' }
+        if (-not (Update-CampusPreferences)) { throw 'Campus settings are unavailable.' }
+        if ((Get-PhysicalLink) -ne 'Campus') { throw 'The campus adapter is not ready.' }
         if (-not (Test-Internet)) { throw 'Initial network is offline.' }
-        $originalProxy = (Get-SystemProxyValue 'ProxyEnable').value
-        $originalMode = (Invoke-ClashApi (Get-LocalClashController -ConfigPath $Config.clash_config_path)).mode
-        $originalTun = Test-ClashTunActive
-        Enter-AuthNetworkContext -StatePath $NetworkStatePath -ClashConfigPath $Config.clash_config_path
-        $report.tun_stopped = -not (Test-ClashTunActive)
-        if (-not $report.tun_stopped) { throw 'TUN did not actually stop.' }
+        $report.proxy_managed = $script:CampusPreferences.ProxyEnabled
+        if ($report.proxy_managed) {
+            $originalProxy = (Get-SystemProxyValue 'ProxyEnable').value
+            $controller = Get-LocalClashController -ConfigPath $Config.clash_config_path
+            $originalMode = if ($controller) { (Invoke-ClashApi $controller).mode }
+            $originalTun = Test-ClashTunActive
+            Enter-AuthNetworkContext -StatePath $NetworkStatePath -ClashConfigPath $Config.clash_config_path
+            $report.tun_stopped = -not (Test-ClashTunActive)
+            if (-not $report.tun_stopped) { throw 'TUN did not actually stop.' }
+        }
         Restart-Client -ForceRestart
         $h = Find-ClientWebWindow
         if ($h -eq [IntPtr]::Zero) { throw 'Client window is missing.' }
@@ -568,19 +589,22 @@ function Invoke-ReconnectSelfTest([string]$Id, [datetime]$Deadline) {
             Start-Sleep -Milliseconds 300
         }
         if (-not $report.disconnected) { throw 'Client did not actually disconnect.' }
-        Log '限时重测: TUN 已停止并已确认真实断网, 开始自动登录'
+        Log '限时重测: 已确认真实断网，开始自动登录'
         if (-not (Invoke-CampusRecovery)) { throw 'Automatic authentication failed.' }
         $report.restored = Restore-AuthNetworkContext -StatePath $NetworkStatePath
         if (-not $report.restored) { throw 'Network setting restoration is pending.' }
-        $mode = (Invoke-ClashApi (Get-LocalClashController -ConfigPath $Config.clash_config_path)).mode
-        if ($mode -ne $originalMode -or (Test-ClashTunActive) -ne $originalTun -or
-            (Get-SystemProxyValue 'ProxyEnable').value -ne $originalProxy) { throw 'Original proxy/TUN settings do not match.' }
+        if ($report.proxy_managed -and $script:CampusPreferences.ProxyEnabled) {
+            $controller = Get-LocalClashController -ConfigPath $Config.clash_config_path
+            $mode = if ($controller) { (Invoke-ClashApi $controller).mode }
+            if ($mode -ne $originalMode -or (Test-ClashTunActive) -ne $originalTun -or
+                (Get-SystemProxyValue 'ProxyEnable').value -ne $originalProxy) { throw 'Original proxy/TUN settings do not match.' }
+        }
         if (-not (Wait-InternetHttp -Targets $HttpProbeTargets -TimeoutMs $ProbeTimeoutMs -Deadline $Deadline)) {
-            throw 'Internet failed after restoring proxy/TUN.'
+            throw 'The direct internet probe failed after authentication.'
         }
         if ((Get-Date) -ge $Deadline) { throw 'Three-minute deadline reached.' }
         $report.passed = $true
-        Log '限时重测通过: 真实断网后自动登录成功, 代理与TUN已恢复'
+        Log '限时重测通过: 真实断网后自动登录成功，外网验证通过'
     } catch {
         $report.error = $_.Exception.Message
         Log ('限时重测未通过: ' + $_.Exception.GetType().Name)
@@ -618,7 +642,7 @@ function Invoke-CommandFile {
     try { $cmd = (Get-Content $f -Raw).Trim() } catch {}
     Remove-Item $f -Force -ErrorAction SilentlyContinue
     if (-not $cmd) { return }
-    Log ('收到命令: ' + $cmd)
+    Log '收到本机控制命令'
     switch -Regex ($cmd) {
         '^test-reconnect ([0-9a-f]{32}) ([0-9]{10})$' {
             $testId = $Matches[1]
@@ -645,7 +669,6 @@ function Invoke-CommandFile {
         'click' {
             $h = Find-ClientWebWindow
             if ($h -ne [IntPtr]::Zero) {
-                Save-WindowShot $h 'pre-manualclick'
                 $p = Get-ClickPoints $h
                 $cx = $p.lpX; $cy = $p.lpY
                 if ($cmd -match 'click\s+(\d+)\s+(\d+)') { $cx = [int]$Matches[1]; $cy = [int]$Matches[2] }
@@ -697,11 +720,15 @@ if ($Check) {
     $adStatus = '未找到'
     if ($ad) { $adStatus = $ad.OperationalStatus }
     Write-Output ('直连外网: ' + (Test-Internet))
-    $lan = Read-LanSettings
-    Write-Output ('Windows 系统代理: ' + [bool]($lan.Flags -band 2) + '  PAC: ' + [bool]($lan.Flags -band 4) + '  TUN: ' + (Test-ClashTunActive))
-    Write-Output ('校园网物理链路: ' + (Get-PhysicalLink) + '  Clash Verge: ' + (Get-VergeExecutable))
+    $settingsRead = Update-CampusPreferences -Quiet
+    if ($settingsRead -and $script:CampusPreferences.ProxyEnabled) {
+        $lan = Read-LanSettings
+        Write-Output ('Windows 系统代理: ' + [bool]($lan.Flags -band 2) + '  PAC: ' + [bool]($lan.Flags -band 4) + '  TUN: ' + (Test-ClashTunActive))
+        Write-Output ('Clash Verge: ' + (Get-SelectedVergeExecutable $Config.clash_config_path))
+    } elseif (-not $settingsRead) { Write-Output '校园网设置暂时不可读' }
+    Write-Output ('校园网物理链路: ' + (Get-PhysicalLink))
     Write-Output '探活:   HTTP 状态码 + 正文校验 (禁用请求代理/重定向/缓存)'
-    Write-Output ('代理保护: ' + [bool]$Config.proxy_guard + '  待恢复设置: ' + (Test-Path -LiteralPath $NetworkStatePath))
+    Write-Output ('代理联动: ' + [bool]$script:CampusPreferences.ProxyEnabled + '  待恢复设置: ' + (Test-Path -LiteralPath $NetworkStatePath))
     Write-Output ('网卡:   ' + $AdapterName + ' -> ' + $adStatus)
     Write-Output ('客户端: ' + [bool](Get-Process -Name $ClientProc -ErrorAction SilentlyContinue) +
                   '  窗口: ' + (Find-ClientWebWindow))
@@ -746,7 +773,7 @@ if (-not $ownsMutex) {
 }
 
 # ---------- 主循环 ----------
-Log '===== 校园网看门狗启动 v1.6.3 ====='
+Log '===== 校园网看门狗启动 v1.7.0 ====='
 $script:fails = 0
 $script:nextProxyRepair = [datetime]::MinValue
 $script:verifyAfterWake = $true
@@ -762,15 +789,14 @@ try {
         exit 1
     }
     $trayReady = [CampusRecovery.StatusTray]::Start((Join-Path $Root 'status.txt'))
-    Write-CampusFile (Join-Path $Root 'ready.txt') ('1.6.3|'+$PID+'|'+$trayReady+'|'+[datetime]::UtcNow.Ticks)
-    try { Initialize-CampusAccountChoice } catch { Log '正在等待本次开机的账号选择。' }
-    Set-CampusStatus 'check' '正在识别校园网及代理状态'
+    Write-CampusFile (Join-Path $Root 'ready.txt') ('1.7.0|'+$PID+'|'+$trayReady+'|'+[datetime]::UtcNow.Ticks)
+    Set-CampusStatus 'check' '正在检查校园网连接'
     $wake = $false
     while ($true) {
         $signalled = [CampusRecovery.StatusTray]::TakeWake()
         if ($wake -or $signalled) {
             $script:verifyAfterWake = $true; $script:fails = 0; $script:nextProxyRepair = [datetime]::MinValue
-            Set-CampusStatus 'wake' '电脑刚刚唤醒，正在检查网卡、校园网和代理'
+            Set-CampusStatus 'wake' '电脑刚刚唤醒，正在检查网卡和校园网连接'
         }
         $before = [datetime]::UtcNow
         try { $delay = Invoke-MonitorPass } catch {

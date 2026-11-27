@@ -298,46 +298,68 @@ namespace CampusRecovery {
             int both=0,total=0;for(int i=0;i<a.Length;i++){both+=Bits(a[i]&b[i]);total+=Bits(a[i])+Bits(b[i]);}return 2.0*both/Math.Max(1,total);
         }
         public static bool MatchesNumber(Bitmap norm,Point button,string user) {
-            if(String.IsNullOrEmpty(user))return false;
-            foreach(char c in user)if(c<'0'||c>'9')return false;
+            return !String.IsNullOrEmpty(user) && HasAccountNumber(norm,button,user);
+        }
+        static bool HasAccountNumber(Bitmap norm,Point button,string user) {
+            if(user!=null)foreach(char c in user)if(c<'0'||c>'9')return false;
             var region=Rectangle.Intersect(new Rectangle(0,0,norm.Width,norm.Height),new Rectangle(button.X-176,button.Y-234,327,46));
             if(region.Width<120||region.Height<24)return false;
             foreach(int level in new[]{170,142,156,125}) {
                 int threshold=level;Func<Color,bool> ink=c=>Math.Max(c.R,Math.Max(c.G,c.B))<threshold;
                 var spans=Runs(norm,region,ink,0).FindAll(v=>v.Width>=3 && v.Width<=23 && v.Height>=12 && v.Height<=36);
-                if(spans.Count==user.Length && MatchDigits(norm,user,spans,ink))return true;
+                bool lengthOk=String.IsNullOrEmpty(user)?spans.Count>=6 && spans.Count<=16:spans.Count==user.Length;
+                if(lengthOk && MatchDigits(norm,user,spans,ink))return true;
             }
             return false;
         }
         static bool MatchDigits(Bitmap norm,string user,List<Rectangle> spans,Func<Color,bool> ink) {
             for(int i=0;i<spans.Count;i++) {
                 int[] bits=DigitMask(norm,spans[i],ink); double expected=0,other=0;
-                foreach(var entry in Patterns)foreach(var mask in entry.Value){double s=Dice(bits,mask);if(entry.Key==user[i])expected=Math.Max(expected,s);else other=Math.Max(other,s);}
+                bool remembered=String.IsNullOrEmpty(user);
+                foreach(var entry in Patterns)foreach(var mask in entry.Value){double s=Dice(bits,mask);if(remembered || entry.Key==user[i])expected=Math.Max(expected,s);else other=Math.Max(other,s);}
+                if(remembered){if(expected<.77)return false;continue;}
                 if(other>expected-.012 || (expected<.77 && (expected<.69 || expected-other<.12)))return false;
             }
             return true;
         }
         static int MaskCount(Bitmap norm,Point b) {
-            var region=Rectangle.Intersect(new Rectangle(0,0,norm.Width,norm.Height),new Rectangle(b.X-176,b.Y-167,327,33));
-            return region.Width<=100?0:Runs(norm,region,Dark,0).FindAll(v=>v.Width>=3 && v.Width<=14 && v.Height>=3 && v.Height<=14).Count;
+            var region=Rectangle.Intersect(new Rectangle(0,0,norm.Width,norm.Height),new Rectangle(b.X-176,b.Y-167,285,33));
+            if(region.Width<=100)return 0;
+            int count=0,centerY=0,previousX=0;
+            foreach(Rectangle mark in Runs(norm,region,Dark,0)) {
+                if(mark.Width<3 || mark.Height<3)continue; // A caret or an input border.
+                if(mark.Width>14 || mark.Height>14 || mark.Width*2<mark.Height || mark.Height*2<mark.Width)return 0;
+                int cx=mark.X+mark.Width/2,cy=mark.Y+mark.Height/2;
+                if((count==0 && mark.X-region.X>65) || (count>0 && (Math.Abs(cy-centerY)>3 || cx-previousX>24)))return 0;
+                if(!Dark(norm.GetPixel(cx,cy)) && !Dark(norm.GetPixel(cx-1,cy)))return 0;
+                count++;centerY=cy;previousX=cx;
+            }
+            return count;
+        }
+        public static bool FormReady(Bitmap norm,Point button,string user) {
+            return HasAccountNumber(norm,button,user) && MaskCount(norm,button)>0;
         }
         static bool FieldOwner(IntPtr h,Bitmap frame,Point p,int offset) {
-            Point o=Point.Empty;int yy=p.Y+offset*frame.Height/914;
-            return ClientToScreen(h,ref o) && OwnedPoint(h,o,p.X-145*frame.Width/533,yy) && OwnedPoint(h,o,p.X-100*frame.Width/533,yy) && OwnedPoint(h,o,p.X+20*frame.Width/533,yy);
+            Point o=Point.Empty;
+            if(!ClientToScreen(h,ref o))return false;
+            for(int row=-14;row<=14;row+=7)for(int col=-172;col<=152;col+=12) {
+                if(!OwnedPoint(h,o,p.X+col*frame.Width/533,p.Y+(offset+row)*frame.Height/914))return false;
+            }
+            return true;
         }
         static IntPtr changingWindow;
         public static bool CheckAccount(IntPtr h,Bitmap glyph,double x,double y,string user,bool requirePassword) {
             if(requirePassword && h==changingWindow)return false;
-            using(var dpi=new DpiScope())return InspectAccount(h,glyph,x,y,user,requirePassword?-1:0);
+            using(var dpi=new DpiScope())return !AccountPoint(h,glyph,x,y,user,requirePassword?-1:0).IsEmpty;
         }
-        static bool InspectAccount(IntPtr h,Bitmap glyph,double x,double y,string user,int passwordCount) {
+        static Point AccountPoint(IntPtr h,Bitmap glyph,double x,double y,string user,int passwordCount) {
             Point p;using(var frame=Capture(h,glyph,x,y,out p)) {
-                if(frame==null || (LastRead=="screen" && (!FieldOwner(h,frame,p,-210) || (passwordCount!=0 && !FieldOwner(h,frame,p,-150)))))return false;
+                if(frame==null || (LastRead=="screen" && (!FieldOwner(h,frame,p,-210) || (passwordCount!=0 && !FieldOwner(h,frame,p,-150)))))return Point.Empty;
                 using(var norm=Normalized(frame)) {
                     Point b=new Point(p.X*533/frame.Width,p.Y*914/frame.Height);
-                    if(!MatchesNumber(norm,b,user))return false;
-                    if(passwordCount==0)return true;
-                    int count=MaskCount(norm,b);return passwordCount<0?count>0:count==passwordCount;
+                    if(passwordCount<0)return FormReady(norm,b,user)?p:Point.Empty;
+                    if(!HasAccountNumber(norm,b,user))return Point.Empty;
+                    return passwordCount==0 || MaskCount(norm,b)==passwordCount?p:Point.Empty;
                 }
             }
         }
@@ -348,7 +370,7 @@ namespace CampusRecovery {
             if(String.IsNullOrEmpty(value) || value.Length>160) return false;
             foreach(char c in value)if(Char.IsControl(c))return false;
             Point p;using(var frame=Capture(h,glyph,.5,.58,out p)) {
-                if(frame==null)return false;
+                if(frame==null || (LastRead=="screen" && !FieldOwner(h,frame,p,offset)))return false;
                 // Mouse messages and text go only to the verified Tianyi window, never to the desktop focus or clipboard.
                 int px=p.X-60*frame.Width/533,py=p.Y+offset*frame.Height/914;
                 Rect dst;IntPtr ctx=SetThreadDpiAwarenessContext(GetWindowDpiAwarenessContext(h));
@@ -372,22 +394,26 @@ namespace CampusRecovery {
             changingWindow=h;
             if(!ReplaceText(h,glyph,user,-210))return false;
             Thread.Sleep(200);
-            if(!InspectAccount(h,glyph,.5,.58,user,0))return false;
+            if(AccountPoint(h,glyph,.5,.58,user,0).IsEmpty)return false;
             // Confirm that this is a masked field before directing the actual saved credential to it.
             if(!ReplaceText(h,glyph,"xx",-150))return false;
             Thread.Sleep(160);
-            if(!InspectAccount(h,glyph,.5,.58,user,2))return false;
+            if(AccountPoint(h,glyph,.5,.58,user,2).IsEmpty)return false;
             if(!ReplaceText(h,glyph,password,-150))return false;
             Thread.Sleep(180);
-            if(!InspectAccount(h,glyph,.5,.58,user,password.Length<=24?password.Length:-1))return false;
+            if(AccountPoint(h,glyph,.5,.58,user,password.Length<=24?password.Length:-1).IsEmpty)return false;
             changingWindow=IntPtr.Zero; return true;
         }
 
         public static bool ClickVerified(IntPtr h, Bitmap glyph, double x, double y, bool physical) {
-            using(var dpi=new DpiScope())return ClickOnClient(h,glyph,x,y,physical);
+            return ClickVerified(h,glyph,x,y,physical,String.Empty);
         }
-        static bool ClickOnClient(IntPtr h, Bitmap glyph, double x, double y, bool physical) {
-            Point p=Read(h,glyph,x,y);
+        public static bool ClickVerified(IntPtr h, Bitmap glyph, double x, double y, bool physical,string user) {
+            using(var dpi=new DpiScope())return ClickOnClient(h,glyph,x,y,physical,user);
+        }
+        static bool ClickOnClient(IntPtr h, Bitmap glyph, double x, double y, bool physical,string user) {
+            if(h==changingWindow)return false;
+            Point p=AccountPoint(h,glyph,x,y,user,-1);
             if(p.IsEmpty || !Usable(h)) return false;
             if(physical) {
                 Point origin=Point.Empty, old;

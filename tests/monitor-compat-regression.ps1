@@ -12,7 +12,7 @@ function Definition([string]$Name) {
     return [scriptblock]::Create($node.Extent.Text)
 }
 function Assert($Ok,[string]$Message) { if (-not $Ok) { throw $Message } }
-function Initialize-CampusAccountChoice { $script:choices++ }
+function Get-CampusPreferences {return [pscustomobject]@{DefaultAccount=''; ProxyEnabled=$false; Accounts=@()}}
 function Get-AuthenticationLock { return $true }
 function Release-AuthenticationLock {}
 function Restore-OwnedAdapter { return $true }

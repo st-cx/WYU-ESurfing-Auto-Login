@@ -2,8 +2,7 @@
     [string]$Package=(Split-Path -Parent $PSScriptRoot),
     [string]$LoginScreenshot,
     [string]$ExpectedUser,
-    [string]$ErrorScreenshot,
-    [string]$CompanionScript
+    [string]$ErrorScreenshot
 )
 $ErrorActionPreference='Stop'
 if ([bool]$LoginScreenshot -ne [bool]$ExpectedUser) { throw 'Supply both a login screenshot and its expected account for the optional recognition check.' }
@@ -31,9 +30,6 @@ try {
     } finally { $graphics.Dispose(); $font.Dispose() }
     Assert-Check ([CampusRecovery.LoginScreen]::MatchesNumber($blank,$match,$digits)) 'all ten digits are recognized in the account field'
     Assert-Check (-not [CampusRecovery.LoginScreen]::MatchesNumber($blank,$match,'0123456780')) 'a one-digit account mismatch is rejected'
-    Assert-Check ([CampusRecovery.StatusTray]::SelectBeforeTimeout('first','second',9999) -ceq 'second') 'an alternate selected within ten seconds wins'
-    Assert-Check ([CampusRecovery.StatusTray]::SelectBeforeTimeout('first','second',10000) -ceq 'first') 'a click after the deadline cannot replace the default'
-    Assert-Check ([CampusRecovery.StatusTray]::SelectBeforeTimeout('first',$null,10000) -ceq 'first') 'ten seconds without input chooses the primary'
     if($LoginScreenshot) {
         $pic=[Drawing.Bitmap]::new($LoginScreenshot)
         try {
@@ -64,18 +60,4 @@ try {
         $pic=[Drawing.Bitmap]::new($ErrorScreenshot)
         try {Assert-Check ([CampusRecovery.LoginScreen]::Match($pic,$glyph,.5,.58).IsEmpty) 'Tianyi error 108 is never clicked'}finally{$pic.Dispose()}
     }
-    . (Join-Path $Package 'tools\setup.ps1')
-    $fixture = @'
-function Ensure-DefaultAccount {}
-function Load-Accounts {}
-function Unprotect-Text {}
-. $networkModule
-$req = $null
-'@
-    if($CompanionScript){ $fixture = [IO.File]::ReadAllText($CompanionScript) }
-    $body=Get-CompanionUpdate $fixture
-    Assert-Check ($body.Contains('# CampusNet verified account v1.6.2')) 'the compatible companion accepts a selected saved account'
-    Assert-Check ($body -ceq (Get-CompanionUpdate $body)) 'repeating the companion update is idempotent'
-    $tokens=$null;$errors=$null;[Management.Automation.Language.Parser]::ParseInput($body,[ref]$tokens,[ref]$errors)|Out-Null
-    Assert-Check ($errors.Count -eq 0) 'the compatible startup companion parses after the update'
 } finally {$glyph.Dispose();$blank.Dispose()}
