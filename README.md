@@ -42,7 +42,7 @@
 ## 🚀 快速开始
 
 1. **首次安装**　下载并完整解压 [WYU-ESurfing-Auto-Login-v1.6.3.zip](https://github.com/st-cx/WYU-ESurfing-Auto-Login/releases/download/v1.6.3/WYU-ESurfing-Auto-Login-v1.6.3.zip)。先在天翼客户端完成一次登录并记住账号，然后双击 **`一键安装.bat`**。确认 Windows 管理员提示，按需校准登录按钮。
-2. **升级旧版**　用原 Windows 账号双击 [CampusNet-Update-1.6.3.exe](https://github.com/st-cx/WYU-ESurfing-Auto-Login/releases/download/v1.6.3/CampusNet-Update-1.6.3.exe)，也可在解压后的完整包里运行 `CampusNet-Update-1.6.3.cmd`。原有账号、网卡、校准和校园网配置会保留。如果曾删除看门狗的计划任务，请用完整包的 `一键安装.bat` 修复。
+2. **升级旧版**　完全离线时，用原 Windows 账号双击 [独立更新 EXE](https://github.com/st-cx/WYU-ESurfing-Auto-Login/releases/download/v1.6.3/CampusNet-Update-1.6.3.exe)。也可使用 [更新 CMD](https://github.com/st-cx/WYU-ESurfing-Auto-Login/releases/download/v1.6.3/CampusNet-Update-1.6.3.cmd)。它优先读取同目录 EXE，再查本机缓存，单独下载 CMD 且没有缓存时会从本次 GitHub Release 获取 EXE 并校验 SHA-256。完整 ZIP 内附带两个入口，可以离线使用。升级保留账号、网卡、校准和校园网配置。若计划任务已被删除，请用完整包的 `一键安装.bat` 修复。
 3. **可选的账号切换**　双击 `设置默认账号.cmd`，输入自己的校园账号。天翼应当已记住该账号的密码。下次启动时可选择其他账号，选择在本次 Windows 登录内有效。再次运行设置入口并输入 `0` 可恢复使用天翼记住的账号。
 
 升级后会核验新版进程及托盘。更新弹窗会显示结果，详细记录写在 `%LOCALAPPDATA%\CampusNetWatchdog\logs\update.log`。
