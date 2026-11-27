@@ -1,4 +1,6 @@
 ﻿# Shared network checks. Compatible with Windows PowerShell 5.1; no external modules.
+. (Join-Path $PSScriptRoot 'verge.ps1')
+$script:CampusAuthMutexName = 'Global\CampusNetAuthenticationMutex'
 function Test-InternetHttp {
     param(
         [object[]]$Targets = @(
@@ -6,7 +8,8 @@ function Test-InternetHttp {
             @{ url = 'http://wifi.vivo.com.cn/generate_204'; status = 204; body = '' },
             @{ url = 'http://www.msftconnecttest.com/connecttest.txt'; status = 200; body = 'Microsoft Connect Test' }
         ),
-        [int]$TimeoutMs = 3000
+        [int]$TimeoutMs = 3000,
+        [Net.IWebProxy]$Proxy = $null
     )
     foreach ($target in $Targets) {
         $request = $null; $response = $null; $reader = $null
@@ -14,7 +17,7 @@ function Test-InternetHttp {
             $request = [Net.HttpWebRequest]::Create([string]$target.url)
             # A local proxy / TUN can accept TCP before its upstream is available.
             # Require the actual HTTP response, never follow a captive-portal redirect.
-            $request.Proxy = $null
+            $request.Proxy = $Proxy
             $request.AllowAutoRedirect = $false
             $request.KeepAlive = $false
             $request.Timeout = $TimeoutMs
@@ -148,7 +151,8 @@ function Invoke-ClashPipeApi($Controller, [string]$Method, $Payload) {
             throw 'Invalid local Clash request.'
         }
         $pipe = [IO.Pipes.NamedPipeClientStream]::new('.', $Controller.pipe_name,
-            [IO.Pipes.PipeDirection]::InOut, [IO.Pipes.PipeOptions]::Asynchronous)
+            [IO.Pipes.PipeAccessRights]::ReadWrite, [IO.Pipes.PipeOptions]::Asynchronous,
+            [Security.Principal.TokenImpersonationLevel]::Identification, [IO.HandleInheritability]::None)
         $pipe.Connect(2000)
         $body = ''
         if ($null -ne $Payload) { $body = $Payload | ConvertTo-Json -Depth 5 -Compress }
@@ -206,9 +210,7 @@ function Invoke-ClashApi($Controller, [string]$Method = 'GET', $Payload) {
 
 function Save-AuthNetworkState([string]$StatePath, $State) {
     # Write intentions BEFORE changing settings so even a killed process can recover.
-    $tempPath = $StatePath + '.tmp'
-    [IO.File]::WriteAllText($tempPath, ($State | ConvertTo-Json -Depth 8), (New-Object Text.UTF8Encoding($false)))
-    Move-Item -LiteralPath $tempPath -Destination $StatePath -Force -ErrorAction Stop
+    Write-CampusFile $StatePath ($State | ConvertTo-Json -Depth 8)
 }
 
 function Test-ClashTunActive {
@@ -227,7 +229,7 @@ function Wait-ClashTunInactive {
 }
 
 function Get-AuthenticationLock([int]$TimeoutMs = 0) {
-    $mutex = New-Object Threading.Mutex($false, 'Global\CampusNetAuthenticationMutex')
+    $mutex = New-Object Threading.Mutex($false, $script:CampusAuthMutexName)
     try {
         try { $owned = $mutex.WaitOne($TimeoutMs) }
         catch [Threading.AbandonedMutexException] { $owned = $true }
@@ -295,8 +297,18 @@ function Start-LegacyCfw($State) {
     Write-NetworkLog 'Authentication: legacy CFW restarted; original TUN is active again.'
 }
 
-function Enter-AuthNetworkContext([string]$StatePath, [string]$ClashConfigPath = '') {
+function Enter-AuthNetworkContext([string]$StatePath, [string]$ClashConfigPath = '', [switch]$RepairProxy) {
     if (Test-Path -LiteralPath $StatePath) { throw 'Previous network settings still need restoration.' }
+    $exe = Get-SelectedVergeExecutable $ClashConfigPath
+    if ($exe) {
+        $prefs = Read-VergePreferences
+        if ((Get-VergeGui $exe) -or $prefs.proxy -or $prefs.tun) {
+            $saved = New-VergeRecoveryState $exe $RepairProxy.IsPresent
+            Save-AuthNetworkState $StatePath $saved
+            Suspend-VergeContext $saved $StatePath
+            return
+        }
+    }
     $state = [pscustomobject]@{ version = 1; proxy_enable = $null; pac = $null; clash = $null; legacy_cfw = $null }
     Save-AuthNetworkState $StatePath $state
     Update-AuthNetworkContext -StatePath $StatePath -ClashConfigPath $ClashConfigPath
@@ -304,6 +316,15 @@ function Enter-AuthNetworkContext([string]$StatePath, [string]$ClashConfigPath =
 
 function Update-AuthNetworkContext([string]$StatePath, [string]$ClashConfigPath = '') {
     $state = Get-Content -LiteralPath $StatePath -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($state.version -eq 2) {
+        $lan = Read-LanSettings
+        if (($lan.Flags -band 14) -or (Test-ClashTunActive) -or
+            (Get-VergeGui $state.exe) -or (Test-VergePort $state.port)) {
+            Save-VergeLanChanges $StatePath $state $lan
+            Suspend-VergeContext $state $StatePath
+        }
+        return
+    }
     $proxy = Get-SystemProxyValue 'ProxyEnable'
     if ($proxy.exists -and [int]$proxy.value -ne 0) {
         if (-not $state.proxy_enable) { $state.proxy_enable = $proxy; Save-AuthNetworkState $StatePath $state }
@@ -380,6 +401,18 @@ function Restore-AuthNetworkContext([string]$StatePath) {
     if (-not $authLock) { return $false }
     try {
         $state = Get-Content -LiteralPath $StatePath -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
+        if ($state.version -eq 2) {
+            try {
+                Restore-VergeContext $StatePath $state
+                Remove-Item -LiteralPath $StatePath -Force -ErrorAction Stop
+                return $true
+            } catch {
+                $state.restore_failures++
+                Save-AuthNetworkState $StatePath $state
+                Set-CampusStatus 'error' '代理恢复等待重试，已保存原设置'
+                return $false
+            }
+        }
         if ($state.version -ne 1) { throw 'Unsupported network recovery journal.' }
         if ($state.legacy_cfw) {
             Start-LegacyCfw $state.legacy_cfw

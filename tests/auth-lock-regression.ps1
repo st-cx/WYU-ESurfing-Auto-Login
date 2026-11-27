@@ -6,6 +6,7 @@
 $ErrorActionPreference = 'Stop'
 . (Join-Path $RepoRoot 'network.ps1')
 if ($Hold) {
+    $script:CampusAuthMutexName = 'Local\'+[IO.Path]::GetFileName($MarkerRoot)
     $lock = Get-AuthenticationLock
     if (-not $lock) { exit 2 }
     try {
@@ -18,6 +19,7 @@ if ($Hold) {
     exit 0
 }
 $marker = Join-Path ([IO.Path]::GetTempPath()) ('campus-lock-test-' + [guid]::NewGuid().ToString('N'))
+$script:CampusAuthMutexName = 'Local\'+[IO.Path]::GetFileName($marker)
 New-Item -Path $marker -ItemType Directory | Out-Null
 $child = $null; $lock = $null
 try {

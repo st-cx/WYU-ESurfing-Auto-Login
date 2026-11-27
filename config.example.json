@@ -18,6 +18,7 @@
     "fail_threshold": 2,
     "nic_bounce_cooldown_sec": 180,
     "client_start_wait_sec": 12,
+    "login_ready_timeout_sec": 100,
     "auth_settle_wait_sec": 75,
     "proxy_guard": true,
     "clash_config_path": "",
