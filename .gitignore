@@ -7,3 +7,14 @@ shot-*.png
 uia-probe.log
 client-window.png
 proxy-recovery.json*
+status.txt
+ready.txt
+adapter-recovery.txt
+backups/
+accounts.json
+default-account.txt
+alternate-credential.xml
+account-session.txt
+account-prompt-open.txt
+update-result.txt
+CampusNet-Update-*.exe

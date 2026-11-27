@@ -20,6 +20,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $Here = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 $TaskName = 'CampusNetWatchdog'
+. (Join-Path $Here 'tools\setup.ps1')
 
 function Info($m) { Write-Host ('[*] ' + $m) }
 function Ok($m)   { Write-Host ('[+] ' + $m) -ForegroundColor Green }
@@ -36,26 +37,6 @@ function Assert-Admin {
         Err '需要管理员权限, 请双击 "一键安装.bat" 运行 (会自动请求提权)'
         exit 1
     }
-}
-
-function Get-ConsoleUser {
-    # 当前登录(控制台)用户, 防止提权到其他管理员账号时把任务装错用户
-    $u = $null
-    try { $u = (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).UserName } catch {}
-    if (-not $u) { $u = "$env:USERDOMAIN\$env:USERNAME" }
-    return $u
-}
-
-function Get-InstallDir([string]$consoleUser) {
-    $name = $consoleUser.Split('\')[-1]
-    $profileDir = $null
-    try {
-        $profileDir = (Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue |
-            Where-Object { $_.LocalPath -and ($_.LocalPath.Split('\')[-1] -ieq $name) } |
-            Select-Object -First 1).LocalPath
-    } catch {}
-    if (-not $profileDir) { $profileDir = Join-Path 'C:\Users' $name }
-    return (Join-Path $profileDir 'AppData\Local\CampusNetWatchdog')
 }
 
 function Find-ClientDir {
@@ -107,102 +88,133 @@ function Find-Adapter {
     return $pool[0].Name
 }
 
+$consoleUser = Get-ConsoleUser
+$installDir = Get-InstallDir $consoleUser
+$companion = Get-CompanionPath $installDir
+$watch = Join-Path $installDir 'watchdog.ps1'
+$task = Get-CampusTask $TaskName $watch
+
 # ==================== 卸载 ====================
 if ($Uninstall) {
     Assert-Admin
-    $consoleUser = Get-ConsoleUser
-    $installDir = Get-InstallDir $consoleUser
-    Info ('结束并删除计划任务: ' + $TaskName)
-    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    $networkState = Join-Path $installDir 'proxy-recovery.json'
-    if (Test-Path -LiteralPath $networkState) {
-        . (Join-Path $Here 'network.ps1')
-        if (-not (Restore-AuthNetworkContext -StatePath $networkState)) {
+    . (Join-Path $Here 'network.ps1')
+    $lock = Get-AuthenticationLock -TimeoutMs 180000
+    if (-not $lock) { throw '校园网认证正在进行，请稍后重试卸载。' }
+    try {
+        $task = Get-CampusTask $TaskName $watch
+        Info ('结束并删除计划任务: ' + $TaskName)
+        if ($task) { Stop-ScheduledTask -TaskName $TaskName -ErrorAction Stop }
+        $networkState = Join-Path $installDir 'proxy-recovery.json'
+        $otherState = Join-Path ([IO.Path]::GetDirectoryName($companion)) 'proxy-recovery.json'
+        if (-not (Restore-AuthNetworkContext $networkState) -or -not (Restore-AuthNetworkContext $otherState)) {
             throw '代理尚未恢复, 已保留安装目录。请启动 Clash 后重试卸载。'
         }
-    }
-    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
-    if (Test-Path $installDir) {
-        Info ('删除安装目录: ' + $installDir)
-        Remove-Item -LiteralPath $installDir -Recurse -Force -ErrorAction SilentlyContinue
-    }
+        if ([IO.File]::Exists($companion)) {
+            $original = $null
+            try { $original = Read-CompanionScript $companion }
+            catch [Text.DecoderFallbackException] { Warn '已保留使用其他编码的自定义 CampusNetAuto 入口。' }
+            $cleaned = if ($null -ne $original) { Remove-CompanionHooks $original }
+            if ($cleaned -cne $original) {
+                Initialize-CampusNative
+                Write-CompanionScript $companion $cleaned
+            }
+        }
+        if ($task) { Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop }
+        if (Test-Path $installDir) {
+            Info ('删除安装目录: ' + $installDir)
+            Remove-Item -LiteralPath $installDir -Recurse -Force -ErrorAction Stop
+        }
+    } finally { Release-AuthenticationLock $lock }
     Ok '卸载完成'
     exit 0
 }
 
 # ==================== 探测 ====================
-Info '检测天翼校园客户端安装位置...'
-$clientDir = Find-ClientDir
-if (-not $clientDir) {
-    Warn '未能自动找到客户端 (需要 ESurfingClient.exe 所在目录)'
-    Warn '请先安装并登录一次 "天翼校园客户端", 然后重新运行本安装程序'
-    $clientDir = Read-Host '也可手动输入客户端安装目录 (直接回车取消)'
-    if (-not $clientDir) { exit 1 }
-    $clientDir = $clientDir.Trim().Trim('"')
-    if (-not (Test-Path (Join-Path $clientDir 'ESurfingClient.exe'))) {
-        Err ('该目录下没有 ESurfingClient.exe: ' + $clientDir)
-        exit 1
-    }
+if ($task -and [IO.File]::Exists($watch)) {
+    & (Join-Path $Here 'upgrade.ps1') -Preview:$DryRun
+    return
 }
-Ok ('客户端目录: ' + $clientDir)
-
-Info '检测上网网卡...'
-$adapterName = Find-Adapter
-if (-not $adapterName) {
-    Warn '未找到正在连接的网卡, 请确认有线网线已插好'
-    $adapterName = Read-Host '可手动输入网卡名称 (网络连接里看到的名称, 直接回车取消)'
-    if (-not $adapterName) { exit 1 }
-    $adapterName = $adapterName.Trim()
-}
-$upAdapters = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' })
-if ($upAdapters.Count -gt 1 -and -not $NoCalibrate) {
-    Write-Host '检测到多个在用网卡:'
-    for ($i = 0; $i -lt $upAdapters.Count; $i++) {
-        Write-Host ('    [{0}] {1}  ({2})' -f ($i + 1), $upAdapters[$i].Name, $upAdapters[$i].InterfaceDescription)
-    }
-    $sel = Read-Host ('默认使用 [' + $adapterName + '], 回车确认, 或输入序号更换')
-    if ($sel) {
-        $n = 0
-        if ([int]::TryParse($sel, [ref]$n) -and $n -ge 1 -and $n -le $upAdapters.Count) {
-            $adapterName = $upAdapters[$n - 1].Name
+$cfgPath = Join-Path $installDir 'config.json'
+$saved = if ([IO.File]::Exists($cfgPath)) { [IO.File]::ReadAllText($cfgPath) | ConvertFrom-Json }
+$useSavedConfig = $saved -and $saved.client_dir -and $saved.adapter_name
+if ($useSavedConfig) {
+    Info '沿用现有客户端、网卡及校准设置，重新注册计划任务。'
+    $clientDir = $saved.client_dir
+    $adapterName = $saved.adapter_name
+    $campusGuard = [bool]$saved.campus_guard
+    $ipPrefixes = @($saved.campus_ip_prefixes)
+    $gateways = @($saved.campus_gateways)
+} else {
+    Info '检测天翼校园客户端安装位置...'
+    $clientDir = Find-ClientDir
+    if (-not $clientDir) {
+        Warn '未能自动找到客户端 (需要 ESurfingClient.exe 所在目录)'
+        Warn '请先安装并登录一次 "天翼校园客户端", 然后重新运行本安装程序'
+        $clientDir = Read-Host '也可手动输入客户端安装目录 (直接回车取消)'
+        if (-not $clientDir) { exit 1 }
+        $clientDir = $clientDir.Trim().Trim('"')
+        if (-not (Test-Path (Join-Path $clientDir 'ESurfingClient.exe'))) {
+            Err ('该目录下没有 ESurfingClient.exe: ' + $clientDir)
+            exit 1
         }
     }
-}
-Ok ('上网网卡: ' + $adapterName)
+    Ok ('客户端目录: ' + $clientDir)
 
-# ---------- 探测校园网特征 (供"离校静默"守卫: 不在校园网时不折腾) ----------
-Info '探测校园网特征 (离校静默守卫)...'
-$ipPrefixes = @()
-try {
-    $ips = Get-NetIPAddress -InterfaceAlias $adapterName -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-        Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' }
-    foreach ($ip in $ips) {
-        $parts = $ip.IPAddress.Split('.')
-        if ($parts.Count -eq 4) { $ipPrefixes += ($parts[0] + '.' + $parts[1] + '.') }
+    Info '检测上网网卡...'
+    $adapterName = Find-Adapter
+    if (-not $adapterName) {
+        Warn '未找到正在连接的网卡, 请确认有线网线已插好'
+        $adapterName = Read-Host '可手动输入网卡名称 (网络连接里看到的名称, 直接回车取消)'
+        if (-not $adapterName) { exit 1 }
+        $adapterName = $adapterName.Trim()
     }
-    $ipPrefixes = @($ipPrefixes | Select-Object -Unique)
-} catch {}
-$gateways = @()
-try {
-    $gateways = @(Get-NetRoute -InterfaceAlias $adapterName -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
-        Where-Object { $_.NextHop -and $_.NextHop -ne '0.0.0.0' } |
-        Select-Object -ExpandProperty NextHop | Select-Object -Unique)
-} catch {}
+    $upAdapters = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' })
+    if ($upAdapters.Count -gt 1 -and -not $NoCalibrate) {
+        Write-Host '检测到多个在用网卡:'
+        for ($i = 0; $i -lt $upAdapters.Count; $i++) {
+            Write-Host ('    [{0}] {1}  ({2})' -f ($i + 1), $upAdapters[$i].Name, $upAdapters[$i].InterfaceDescription)
+        }
+        $sel = Read-Host ('默认使用 [' + $adapterName + '], 回车确认, 或输入序号更换')
+        if ($sel) {
+            $n = 0
+            if ([int]::TryParse($sel, [ref]$n) -and $n -ge 1 -and $n -le $upAdapters.Count) {
+                $adapterName = $upAdapters[$n - 1].Name
+            }
+        }
+    }
+    Ok ('上网网卡: ' + $adapterName)
 
-$campusGuard = $true
-$privatePrefixes = @($ipPrefixes | Where-Object { $_ -match '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)$' })
-if ($ipPrefixes.Count -eq 0) {
-    $campusGuard = $false
-    Warn '未能获取本机 IP, 已关闭"离校静默"守卫 (稍后可在 config.json 手动配置)'
-} elseif ($privatePrefixes.Count -eq $ipPrefixes.Count) {
-    # 全是家用/普通私网地址, 判定当前可能不在校园网 → 关闭守卫(避免回校后无法自动恢复)
-    $campusGuard = $false
-    Warn ('当前网络看起来不是校园网 (IP前缀: ' + ($ipPrefixes -join ',') + '), 已关闭"离校静默"守卫;')
-    Warn '  如果你现在就在校园网, 可重新运行安装, 或稍后在 config.json 设置 campus_guard=true'
+    # ---------- 探测校园网特征 (供"离校静默"守卫: 不在校园网时不折腾) ----------
+    Info '探测校园网特征 (离校静默守卫)...'
+    $ipPrefixes = @()
+    try {
+        $ips = Get-NetIPAddress -InterfaceAlias $adapterName -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' }
+        foreach ($ip in $ips) {
+            $parts = $ip.IPAddress.Split('.')
+            if ($parts.Count -eq 4) { $ipPrefixes += ($parts[0] + '.' + $parts[1] + '.') }
+        }
+        $ipPrefixes = @($ipPrefixes | Select-Object -Unique)
+    } catch {}
+    $gateways = @()
+    try {
+        $gateways = @(Get-NetRoute -InterfaceAlias $adapterName -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+            Where-Object { $_.NextHop -and $_.NextHop -ne '0.0.0.0' } |
+            Select-Object -ExpandProperty NextHop | Select-Object -Unique)
+    } catch {}
+
+    $campusGuard = $true
+    $privatePrefixes = @($ipPrefixes | Where-Object { $_ -match '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)$' })
+    if ($ipPrefixes.Count -eq 0) {
+        $campusGuard = $false
+        Warn '未能获取本机 IP, 已关闭"离校静默"守卫 (稍后可在 config.json 手动配置)'
+    } elseif ($privatePrefixes.Count -eq $ipPrefixes.Count) {
+        # 全是家用/普通私网地址, 判定当前可能不在校园网 → 关闭守卫(避免回校后无法自动恢复)
+        $campusGuard = $false
+        Warn ('当前网络看起来不是校园网 (IP前缀: ' + ($ipPrefixes -join ',') + '), 已关闭"离校静默"守卫;')
+        Warn '  如果你现在就在校园网, 可重新运行安装, 或稍后在 config.json 设置 campus_guard=true'
+    }
 }
-
-$consoleUser = Get-ConsoleUser
-$installDir = Get-InstallDir $consoleUser
 
 if ($DryRun) {
     Info '===== DryRun 结果 (未做任何改动) ====='
@@ -218,98 +230,105 @@ if ($DryRun) {
 # ==================== 安装 ====================
 Assert-Admin
 
-Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-Start-Sleep -Seconds 2   # 等旧进程释放全局互斥锁, 避免新实例启动后立即退出
-$networkState = Join-Path $installDir 'proxy-recovery.json'
-if (Test-Path -LiteralPath $networkState) {
-    . (Join-Path $Here 'network.ps1')
-    if (-not (Restore-AuthNetworkContext -StatePath $networkState)) {
-        throw '代理尚未恢复, 已暂停升级。请启动 Clash 后重试安装。'
+. (Join-Path $Here 'network.ps1')
+$lock = Get-AuthenticationLock -TimeoutMs 180000
+if (-not $lock) { throw '校园网认证正在进行，请稍后重试安装。' }
+try {
+    $task = Get-CampusTask $TaskName $watch
+    if ($task -and [IO.File]::Exists($watch)) {
+        & (Join-Path $Here 'upgrade.ps1')
+        return
     }
-}
-Info ('安装到: ' + $installDir)
-New-Item -ItemType Directory -Path $installDir -Force | Out-Null
-New-Item -ItemType Directory -Path (Join-Path $installDir 'tools') -Force | Out-Null
+    if ($task) { Stop-ScheduledTask -TaskName $TaskName -ErrorAction Stop }
+    Start-Sleep -Seconds 2   # 等旧进程释放全局互斥锁, 避免新实例启动后立即退出
+    $networkState = Join-Path $installDir 'proxy-recovery.json'
+    if (Test-Path -LiteralPath $networkState) {
+        if (-not (Restore-AuthNetworkContext -StatePath $networkState)) {
+            throw '代理尚未恢复, 已暂停升级。请启动 Clash 后重试安装。'
+        }
+    }
+    Info ('安装到: ' + $installDir)
+    New-Item -ItemType Directory -Path $installDir -Force | Out-Null
 
-Copy-Item (Join-Path $Here 'watchdog.ps1') $installDir -Force
-Copy-Item (Join-Path $Here 'network.ps1') $installDir -Force
-$probe = Join-Path $Here 'tools\uia-probe.ps1'
-if (Test-Path $probe) { Copy-Item $probe (Join-Path $installDir 'tools') -Force }
-$calib = Join-Path $Here 'tools\calibrate.ps1'
-if (Test-Path $calib) { Copy-Item $calib (Join-Path $installDir 'tools') -Force }
+    foreach ($name in (Get-CampusProgramFiles)) {
+        $destination = Join-Path $installDir $name
+        [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($destination))
+        Copy-Item -LiteralPath (Join-Path $Here $name) -Destination $destination -Force
+    }
+    if (-not $useSavedConfig) {
+        # 生成 config.json (保留用户已调过的其它项)
+        $cfg = [ordered]@{}
+        if (Test-Path $cfgPath) {
+            try {
+                $old = Get-Content $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
+                foreach ($p in $old.PSObject.Properties) { $cfg[$p.Name] = $p.Value }
+            } catch {}
+        }
+        $cfg['client_dir'] = $clientDir
+        $cfg['adapter_name'] = $adapterName
 
-# 生成"校准按钮坐标.bat"到安装目录 (方便日后重新校准, 不依赖安装包)
-# 注意: bat 内容必须为纯 ASCII —— cmd 在部分代码页下解析含非 ASCII 的批处理
-# 会错位(乱码/执行残片), 中文提示一律由 calibrate.ps1 输出
-$calibBat = @"
-@echo off
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\calibrate.ps1"
-if errorlevel 1 (
-  echo.
-  pause
-)
-"@
-$calibBat = $calibBat -replace "`r?`n", "`r`n"   # 批处理统一用 CRLF 换行
-[IO.File]::WriteAllText((Join-Path $installDir '校准按钮坐标.bat'), $calibBat, (New-Object Text.UTF8Encoding($false)))
+        # 离校静默守卫: 已有有效配置则保留(避免覆盖用户手工调整), 否则写入本次探测结果
+        $keepCampus = $false
+        if ($cfg.Contains('campus_guard') -and $cfg['campus_guard'] -eq $true -and
+            (($cfg['campus_ip_prefixes'] | Where-Object { $_ }) -or ($cfg['campus_gateways'] | Where-Object { $_ }))) {
+            $keepCampus = $true
+        }
+        if ($keepCampus) {
+            Ok ('保留已有校园网特征: 前缀=[' + (@($cfg['campus_ip_prefixes']) -join ',') + '] 网关=[' +
+                (@($cfg['campus_gateways']) -join ',') + ']')
+        } elseif ($campusGuard) {
+            $cfg['campus_guard'] = $true
+            $cfg['campus_ip_prefixes'] = $ipPrefixes
+            $cfg['campus_gateways'] = $gateways
+            Ok ('离校守卫已启用: 校园IP前缀=[' + ($ipPrefixes -join ',') + '] 网关=[' + ($gateways -join ',') + ']')
+            Info '  (带电脑去其他地方/连热点时, 探测失败也不会重启客户端或动网卡)'
+        } else {
+            $cfg['campus_guard'] = $false
+        }
 
-# 生成 config.json (保留用户已调过的其它项)
-$cfgPath = Join-Path $installDir 'config.json'
-$cfg = [ordered]@{}
-if (Test-Path $cfgPath) {
-    try {
-        $old = Get-Content $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
-        foreach ($p in $old.PSObject.Properties) { $cfg[$p.Name] = $p.Value }
-    } catch {}
-}
-$cfg['client_dir'] = $clientDir
-$cfg['adapter_name'] = $adapterName
+        $json = $cfg | ConvertTo-Json -Depth 100
+        [IO.File]::WriteAllText($cfgPath, $json, (New-Object Text.UTF8Encoding($false)))
+        Ok ('配置已写入: ' + $cfgPath)
+    }
 
-# 离校静默守卫: 已有有效配置则保留(避免覆盖用户手工调整), 否则写入本次探测结果
-$keepCampus = $false
-if ($cfg.Contains('campus_guard') -and $cfg['campus_guard'] -eq $true -and
-    (($cfg['campus_ip_prefixes'] | Where-Object { $_ }) -or ($cfg['campus_gateways'] | Where-Object { $_ }))) {
-    $keepCampus = $true
-}
-if ($keepCampus) {
-    Ok ('保留已有校园网特征: 前缀=[' + (@($cfg['campus_ip_prefixes']) -join ',') + '] 网关=[' +
-        (@($cfg['campus_gateways']) -join ',') + ']')
-} elseif ($campusGuard) {
-    $cfg['campus_guard'] = $true
-    $cfg['campus_ip_prefixes'] = $ipPrefixes
-    $cfg['campus_gateways'] = $gateways
-    Ok ('离校守卫已启用: 校园IP前缀=[' + ($ipPrefixes -join ',') + '] 网关=[' + ($gateways -join ',') + ']')
-    Info '  (带电脑去其他地方/连热点时, 探测失败也不会重启客户端或动网卡)'
-} else {
-    $cfg['campus_guard'] = $false
-}
-
-$json = $cfg | ConvertTo-Json
-[IO.File]::WriteAllText($cfgPath, $json, (New-Object Text.UTF8Encoding($false)))
-Ok ('配置已写入: ' + $cfgPath)
-
-Info '注册计划任务 (登录时自启, 最高权限)...'
-Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue   # 若旧实例在运行先结束
-$action = New-ScheduledTaskAction -Execute 'powershell.exe' `
-    -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' +
-               (Join-Path $installDir 'watchdog.ps1') + '"')
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User $consoleUser
-$trigger.Delay = 'PT20S'
-$principal = New-ScheduledTaskPrincipal -UserId $consoleUser -LogonType Interactive -RunLevel Highest
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-    -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) `
-    -StartWhenAvailable
-Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
-    -Principal $principal -Settings $settings -Force | Out-Null
-Start-ScheduledTask -TaskName $TaskName
-Start-Sleep -Seconds 6
-$t = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-if ($t -and $t.State -eq 'Ready' -and (Get-ScheduledTaskInfo -TaskName $TaskName).LastTaskResult -eq 0) {
+    Info '注册计划任务 (登录时自启, 最高权限)...'
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
+        -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' +
+                   (Join-Path $installDir 'watchdog.ps1') + '"')
+    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $consoleUser
+    $trigger.Delay = 'PT0S'
+    $principal = New-ScheduledTaskPrincipal -UserId $consoleUser -LogonType Interactive -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+        -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) `
+        -StartWhenAvailable
+    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
+        -Principal $principal -Settings $settings -Force | Out-Null
+    try { [void](Add-WakeTrigger (Get-ScheduledTask -TaskName $TaskName)) }
+    catch { Warn ('Windows 未接受附加唤醒触发器。常驻程序仍会监听唤醒。'+$_.Exception.Message) }
     Start-ScheduledTask -TaskName $TaskName
-    Start-Sleep -Seconds 3
-    $t = Get-ScheduledTask -TaskName $TaskName
-}
-if ($t -and $t.State -eq 'Running') { Ok ('计划任务状态: ' + $t.State) }
-else { throw '计划任务未保持运行, 请检查日志后重新安装' }
+    Start-Sleep -Seconds 6
+    $t = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    if ($t -and $t.State -eq 'Ready' -and (Get-ScheduledTaskInfo -TaskName $TaskName).LastTaskResult -eq 0) {
+        Start-ScheduledTask -TaskName $TaskName
+        Start-Sleep -Seconds 3
+        $t = Get-ScheduledTask -TaskName $TaskName
+    }
+    if ($t -and $t.State -eq 'Running') { Ok ('计划任务状态: ' + $t.State) }
+    else { throw '计划任务未保持运行, 请检查日志后重新安装' }
+
+    $edit = Get-CompanionEdit $companion
+    if ($edit.Warning) { Warn $edit.Warning }
+    if ($edit.Updated) {
+        try {
+            Initialize-CampusNative
+            $backup = Join-Path $installDir ('backups\'+[guid]::NewGuid().ToString('N')+'\campus-auth.ps1')
+            [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($backup))
+            [IO.File]::Copy($companion,$backup)
+            if ((Read-CompanionScript $companion) -cne $edit.Original) { throw '开机认证入口在安装期间发生变化。请重试。' }
+            Write-CompanionScript $companion $edit.Updated
+        } catch { Warn ('看门狗已启动，未更新可选的 CampusNetAuto 入口：'+$_.Exception.Message) }
+    }
+} finally { Release-AuthenticationLock $lock }
 
 $log = Join-Path $installDir 'logs\watchdog.log'
 if (Test-Path $log) {

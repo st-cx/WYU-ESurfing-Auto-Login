@@ -1,0 +1,3 @@
+# Store Windows launchers with their literal CRLFs, including in GitHub source ZIPs.
+*.bat -text whitespace=trailing-space,space-before-tab,cr-at-eol
+*.cmd -text whitespace=trailing-space,space-before-tab,cr-at-eol

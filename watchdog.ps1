@@ -5,7 +5,7 @@
 #  功能:
 #    - 每 check_interval_sec 秒验证外网 HTTP 响应 (避免 Clash TUN 的 TCP 假阳性)
 #    - 连续 fail_threshold 次失败判定断网, 自动执行恢复梯子:
-#        第1级: 重启客户端 + 后台点击"登 录"按钮 (不抢鼠标, 锁屏也有效)
+#        第1级: 等待官方客户端就绪，识别登录按钮后后台提交
 #        第2级: 禁用/启用网卡 + 重启客户端 + 再点登录 (带冷却, 防反复断网)
 #    - 恢复成功/断网时弹 Windows 通知
 #
@@ -21,6 +21,7 @@
 # ============================================================
 
 param(
+    [switch]$Embedded,        # 由现有开机任务调用同一套恢复流程
     [switch]$Check,           # 仅探活, 不修改代理/客户端/网卡
     [switch]$RecoverOnce,     # 仅执行一次自动恢复 (排障/验收用)
     [switch]$RestoreNetwork   # 仅恢复上次认证临时修改的代理设置
@@ -61,6 +62,7 @@ $Config = [ordered]@{
     probe_timeout_ms        = 2000
     nic_bounce_cooldown_sec = 180
     client_start_wait_sec   = 12
+    login_ready_timeout_sec = 100
     auth_settle_wait_sec    = 75
     proxy_guard             = $true
     clash_config_path       = ''
@@ -71,6 +73,9 @@ $Config = [ordered]@{
     )
 }
 $configPath = Join-Path $Root 'config.json'
+if ($Check -and -not (Test-Path -LiteralPath $configPath)) {
+    $configPath = Join-Path $env:LOCALAPPDATA 'CampusNetWatchdog\config.json'
+}
 $configError = $null
 if (Test-Path $configPath) {
     try {
@@ -94,11 +99,14 @@ $CheckIntervalSec   = [int]$Config.check_interval_sec
 $FailThreshold      = [int]$Config.fail_threshold
 $ProbeTimeoutMs     = [int]$Config.probe_timeout_ms
 $NicBounceCooldown  = [int]$Config.nic_bounce_cooldown_sec
-$ClientStartWaitSec = [int]$Config.client_start_wait_sec
+$ClientStartWaitSec = [Math]::Max(0,[int]$Config.client_start_wait_sec)
+$LoginReadyTimeout = [Math]::Max(10,[int]$Config.login_ready_timeout_sec)
 $AuthSettleWaitSec  = [int]$Config.auth_settle_wait_sec
 $HttpProbeTargets   = $Config.http_probe_targets
 . (Join-Path $Root 'network.ps1')
+. (Join-Path $Root 'monitor.ps1')
 $NetworkStatePath   = Join-Path $Root 'proxy-recovery.json'
+$AutoNetworkStatePath = Join-Path $env:USERPROFILE 'CampusNetAuto\proxy-recovery.json'
 
 # 离校静默守卫配置
 $CampusGuard = [bool]$Config.campus_guard
@@ -147,6 +155,7 @@ if (-not ([System.Management.Automation.PSTypeName]'CampusWatch.Win32').Type) {
 [System.Runtime.InteropServices.DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(System.IntPtr hWnd, out uint lpdwProcessId);
 [System.Runtime.InteropServices.DllImport("user32.dll")] public static extern System.IntPtr GetWindowDpiAwarenessContext(System.IntPtr hWnd);
 [System.Runtime.InteropServices.DllImport("user32.dll")] public static extern int GetAwarenessFromDpiAwarenessContext(System.IntPtr value);
+[System.Runtime.InteropServices.DllImport("user32.dll", CharSet=System.Runtime.InteropServices.CharSet.Unicode)] public static extern int GetWindowText(System.IntPtr h, System.Text.StringBuilder text, int length);
 public delegate bool EnumProc(System.IntPtr hWnd, System.IntPtr lParam);
 public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
 "@
@@ -172,53 +181,19 @@ function Test-Internet {
     return (Test-InternetHttp -Targets $HttpProbeTargets -TimeoutMs $ProbeTimeoutMs)
 }
 
-function Test-OnCampus {
-    # 离校静默守卫: 判断当前是否处于校园网环境
-    # 任一在用网卡 IPv4 的前两段匹配 campus_ip_prefixes, 或默认网关匹配
-    # campus_gateways, 即视为在校园网; 守卫未启用时恒为 true
-    if (-not $CampusGuard) { return $true }
-    $prefixes = @()
-    try {
-        $ips = Get-NetIPAddress -InterfaceAlias $AdapterName -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-            Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' }
-        foreach ($ip in $ips) {
-            $parts = $ip.IPAddress.Split('.')
-            if ($parts.Count -eq 4) { $prefixes += ($parts[0] + '.' + $parts[1] + '.') }
-        }
-    } catch {}
-    foreach ($want in $CampusIpPrefixes) {
-        if ($prefixes -contains $want) { return $true }
-    }
-    try {
-        $gws = @(Get-NetRoute -InterfaceAlias $AdapterName -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
-            Where-Object { $_.NextHop -and $_.NextHop -ne '0.0.0.0' } |
-            Select-Object -ExpandProperty NextHop)
-        foreach ($want in $CampusGateways) {
-            if ($gws -contains $want) { return $true }
-        }
-    } catch {}
-    return $false
-}
+function Test-OnCampus { return ((Get-PhysicalLink) -eq 'Campus') }
 
+function Get-CampusWindows {
+    $mine = [Diagnostics.Process]::GetCurrentProcess().SessionId
+    $ids = @(Get-Process -Name $ClientProc -ErrorAction SilentlyContinue | Where-Object {
+        $_.SessionId -eq $mine -and $_.Path -ieq $ClientExe
+    } | ForEach-Object {$_.Id})
+    if ($ids.Count) { [CampusRecovery.LoginScreen]::Windows([int[]]$ids) }
+}
 function Find-ClientWebWindow {
-    # 返回客户端 miniblink 主窗口 (class=wkeWebWindow) 的句柄
-    $script:foundHwnd = [IntPtr]::Zero
-    $procs = Get-Process -Name $ClientProc -ErrorAction SilentlyContinue
-    if (-not $procs) { return $script:foundHwnd }
-    $pids = @($procs | ForEach-Object { $_.Id })
-    $cb = [CampusWatch.Win32+EnumProc]{
-        param($h, $l)
-        $procId = 0
-        [CampusWatch.Win32]::GetWindowThreadProcessId($h, [ref]$procId) | Out-Null
-        if ($pids -contains [int]$procId) {
-            $sb = New-Object System.Text.StringBuilder 256
-            [CampusWatch.Win32]::GetClassName($h, $sb, 256) | Out-Null
-            if ($sb.ToString() -eq 'wkeWebWindow') { $script:foundHwnd = $h; return $false }
-        }
-        return $true
-    }
-    [CampusWatch.Win32]::EnumWindows($cb, [IntPtr]::Zero) | Out-Null
-    return $script:foundHwnd
+    $first = Get-CampusWindows | Select-Object -First 1
+    if ($first) { return [IntPtr]$first }
+    return [IntPtr]::Zero
 }
 
 function Get-WindowRectSafe {
@@ -246,23 +221,19 @@ function Restore-ClientWindow {
 
 function Save-WindowShot {
     param([IntPtr]$h, [string]$tag)
+    $bmp = $null
     try {
-        $rect = Get-WindowRectSafe $h
-        if ($rect.Left -le -30000) { return }
-        $wd = $rect.Right - $rect.Left; $ht = $rect.Bottom - $rect.Top
-        if ($wd -le 50 -or $ht -le 50 -or $wd -gt 4000) { return }
-        $bmp = New-Object System.Drawing.Bitmap($wd, $ht)
-        $g = [System.Drawing.Graphics]::FromImage($bmp)
-        $g.CopyFromScreen($rect.Left, $rect.Top, 0, 0, $bmp.Size)
-        $g.Dispose()
-        $f = Join-Path $LogDir ('shot-' + $tag + '-' + (Get-Date -Format 'MMdd-HHmmss') + '.png')
+        if ($h -notin @(Get-CampusWindows)) { return }
+        $bmp = [CampusRecovery.LoginScreen]::DiagnosticFrame($h)
+        if (-not $bmp) { Log '天翼未返回可保存的窗口画面'; return }
+        $f = Join-Path $LogDir ('shot-' + $tag + '-' + (Get-Date -Format 'MMdd-HHmmss-fff') + '.png')
         $bmp.Save($f, [System.Drawing.Imaging.ImageFormat]::Png)
-        $bmp.Dispose()
         Log ('已保存截图 ' + (Split-Path $f -Leaf))
         Get-ChildItem (Join-Path $LogDir 'shot-*.png') -ErrorAction SilentlyContinue |
             Sort-Object LastWriteTime -Descending | Select-Object -Skip 3 |
             Remove-Item -Force -ErrorAction SilentlyContinue
-    } catch {}
+    } catch { Log '天翼窗口截图未保存' }
+    finally { if ($bmp) { $bmp.Dispose() } }
 }
 
 function Get-WindowAwareness {
@@ -334,170 +305,239 @@ function Send-ClickToWindow {
     [CampusWatch.Win32]::PostMessage($h, 0x202, [IntPtr]0, $lp) | Out-Null  # WM_LBUTTONUP
 }
 
-function Send-RealClick {
-    param([IntPtr]$h)
-    $rect = Restore-ClientWindow $h
-    if (-not $rect) { Log '客户端窗口无法恢复到前台'; return $false }
-    Save-WindowShot $h 'pre-click'
-    $physW = $rect.Right - $rect.Left; $physH = $rect.Bottom - $rect.Top
-    $src = '换算'
-    if ($HasPhysRef) {
-        # 校准工具记录的真实点击位置(已实测生效), 按窗口尺寸等比换算
-        $px = [int][Math]::Round($PhysBtnX * $physW / $PhysWinW)
-        $py = [int][Math]::Round($PhysBtnY * $physH / $PhysWinH)
-        $src = '真实点击参考'
-    } else {
-        $p = Get-ClickPoints $h
-        $px = $p.physX; $py = $p.physY
+function Get-LoginSample {
+    $windows = @(Get-CampusWindows)
+    $script:lastLoginRead = 'no-window'
+    $script:loginWindow = [IntPtr]::Zero
+    foreach ($h in $windows) {
+        if ($script:loginWindow -eq [IntPtr]::Zero) { $script:loginWindow=$h }
+        $p = [CampusRecovery.LoginScreen]::Read($h,$script:LoginGlyph,$script:LoginX,$script:LoginY)
+        $script:lastLoginRead = [CampusRecovery.LoginScreen]::LastRead
+        if (-not $p.IsEmpty) { return [pscustomobject]@{Window=$h; Point=$p} }
     }
-    $sx = $rect.Left + $px; $sy = $rect.Top + $py
-    [CampusWatch.Win32]::SetCursorPos($sx, $sy) | Out-Null
-    Start-Sleep -Milliseconds 200
-    [CampusWatch.Win32]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero)   # LEFTDOWN
-    [CampusWatch.Win32]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero)   # LEFTUP
-    Log ('已前台点击 (' + $sx + ',' + $sy + ') [' + $src + ']')
-    Start-Sleep -Seconds 3
-    [CampusWatch.Win32]::ShowWindow($h, 6) | Out-Null               # SW_MINIMIZE 收回托盘
+}
+
+function Test-SameLoginSample($First,$Second) {
+    return $null -ne $First -and $null -ne $Second -and $First.Window -eq $Second.Window -and
+        [Math]::Abs($First.Point.X-$Second.Point.X) -le 3 -and [Math]::Abs($First.Point.Y-$Second.Point.Y) -le 3
+}
+
+function Update-LoginGuard {
+    if (Test-Path -LiteralPath $NetworkStatePath) {
+        Update-AuthNetworkContext -StatePath $NetworkStatePath -ClashConfigPath $Config.clash_config_path
+    }
+}
+
+function Send-RecognizedLogin($Sample,[bool]$Physical) {
+    $tag = if ($Physical) { 'pre-click' } else { 'pre-bgclick' }
+    Save-WindowShot $Sample.Window $tag
+    if ($Sample.Window -notin @(Get-CampusWindows)) { return $false }
+    if ($script:CampusAccountUser -and -not [CampusRecovery.LoginScreen]::CheckAccount($Sample.Window,$script:LoginGlyph,$script:LoginX,$script:LoginY,$script:CampusAccountUser,$true)) { return $false }
+    if (-not [CampusRecovery.LoginScreen]::ClickVerified($Sample.Window,$script:LoginGlyph,$script:LoginX,$script:LoginY,$Physical)) { return $false }
+    $script:submittedWindow = $Sample.Window
     return $true
 }
 
-function Invoke-LoginClick {
-    $h = Find-ClientWebWindow
-    if ($h -eq [IntPtr]::Zero) { Log '未找到客户端主窗口(wkeWebWindow)'; return $false }
-
-    # 1) 后台点击 (不打扰用户)
-    Save-WindowShot $h 'pre-bgclick'
-    $p = Get-ClickPoints $h
-    Send-ClickToWindow $h $p.lpX $p.lpY
-    Log ('已发送后台点击 (客户端坐标 ' + $p.lpX + ',' + $p.lpY + ')')
-    Start-Sleep -Seconds 6
-    if (Test-Internet) {
-        Log '后台点击已生效, 网络恢复'
-        [CampusWatch.Win32]::ShowWindow($h, 6) | Out-Null   # 收回最小化
-        return $true
+function Invoke-LoginClick([scriptblock]$BeforeLogin) {
+    Set-CampusStatus 'loading' '天翼正在加载，等待识别“登录”按钮'
+    $end = [datetime]::UtcNow.AddSeconds($LoginReadyTimeout)
+    $nextProbe = [datetime]::MinValue
+    $showAfter = [datetime]::UtcNow.AddSeconds(5)
+    $announced = $null; $revealed = $false
+    $previous = $null
+    while ([datetime]::UtcNow -lt $end) {
+        if ($script:RecoveryDeadline -and (Get-Date) -ge $script:RecoveryDeadline) { return 'Timeout' }
+        if ([datetime]::UtcNow -ge $nextProbe) {
+            Update-LoginGuard
+            if (Test-Internet) { return 'Online' }
+            $nextProbe = [datetime]::UtcNow.AddSeconds(6)
+        }
+        $sample = Get-LoginSample
+        if (-not $sample -and [datetime]::UtcNow -ge $showAfter) {
+            if ($script:lastLoginRead -ne $announced) {
+                $hint = switch ($script:lastLoginRead) {
+                    'no-window' {'天翼进程正在启动，等待主窗口'}
+                    'covered' {'天翼窗口被遮挡，正在重新读取登录页'}
+                    'hidden' {'正在显示天翼登录窗口'}
+                    'desktop' {'等待可读取的天翼窗口'}
+                    default {'已找到天翼窗口，等待登录表单绘制完成'}
+                }
+                Set-CampusStatus 'loading' $hint
+                Log ('天翼识别状态：'+$script:lastLoginRead)
+                $announced=$script:lastLoginRead
+            }
+            if (-not $revealed -and $script:loginWindow -and $script:loginWindow -ne [IntPtr]::Zero -and $script:lastLoginRead -in @('hidden','covered','no-glyph')) {
+                [CampusRecovery.LoginScreen]::Reveal($script:loginWindow); $revealed=$true
+            }
+        }
+        if (Test-SameLoginSample $previous $sample) {
+            Set-CampusStatus 'ready' '已识别到登录按钮，正在提交认证'
+            if ($script:CampusAccountUser) {
+                if (-not (Confirm-CampusAccount $sample)) { $script:accountPending=$true; return 'AccountPending' }
+            } elseif ($BeforeLogin) { & $BeforeLogin | Out-Null; $BeforeLogin = $null }
+            Update-LoginGuard
+            if (Test-Internet) { return 'Online' }
+            if (Send-RecognizedLogin $sample $false) {
+                Set-CampusStatus 'auth' '已点击登录，等待天翼认证并核验外网'
+                return 'Submitted'
+            }
+            Set-CampusStatus 'loading' '天翼界面已变化，正在重新识别'
+            $sample = $null
+        }
+        $previous = $sample
+        Start-Sleep -Milliseconds 650
     }
-
-    # 2) 前台真实点击
-    Log '后台点击未生效, 改用前台真实点击'
-    return (Send-RealClick $h)
+    $script:loginTimedOut = $true
+    Set-CampusStatus 'error' '等待天翼登录界面超时，本轮未点击'
+    return 'Timeout'
 }
 
 function Wait-AuthSettle {
-    # 点击/重启后耐心等客户端完成认证, 避免过早重启打断它的登录流程
-    $deadline = (Get-Date).AddSeconds($AuthSettleWaitSec)
-    while ((Get-Date) -lt $deadline) {
-        if ($script:RecoveryDeadline -and (Get-Date) -ge $script:RecoveryDeadline) { throw 'Recovery deadline reached.' }
-        if (Test-Path -LiteralPath $NetworkStatePath) {
-            Update-AuthNetworkContext -StatePath $NetworkStatePath -ClashConfigPath $Config.clash_config_path
-        }
+    $end = [datetime]::UtcNow.AddSeconds($AuthSettleWaitSec)
+    $retryAt = [datetime]::UtcNow.AddSeconds(25)
+    $previous = $null
+    while ([datetime]::UtcNow -lt $end) {
+        if ($script:RecoveryDeadline -and (Get-Date) -ge $script:RecoveryDeadline) { return $false }
+        Update-LoginGuard
         if (Test-Internet) { return $true }
-        Start-Sleep -Seconds 8
+        if ([datetime]::UtcNow -ge $retryAt) {
+            $sample = Get-LoginSample
+            if (Test-SameLoginSample $previous $sample) {
+                if ((Confirm-CampusAccount $sample) -and (Send-RecognizedLogin $sample $true)) {
+                    Set-CampusStatus 'auth' '天翼仍显示登录按钮，已重新提交，等待认证'
+                    $retryAt = [datetime]::MaxValue
+                }
+            }
+            $previous = $sample
+        }
+        Start-Sleep -Seconds 2
     }
     return (Test-Internet)
 }
 
-function Restart-Client {
-    Log '重启天翼校园客户端'
-    try {
-        Get-Process -Name $ClientProc -ErrorAction SilentlyContinue |
-            Stop-Process -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Seconds 2
-    } catch {}
-    try {
-        Start-Process -FilePath $ClientExe -WorkingDirectory $ClientDir
-    } catch {
-        Log ('客户端启动失败: ' + $_.Exception.Message)
+function Restart-Client([switch]$ForceRestart) {
+    Set-CampusStatus 'client' '正在启动天翼校园客户端'
+    $serviceKey = Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Services\ESurfingSvr' -ErrorAction SilentlyContinue
+    if ($serviceKey -and ([string]$serviceKey.ImagePath).Trim('"') -ieq (Join-Path $ClientDir 'ESurfingSvr.exe')) {
+        $service = Get-Service -Name 'ESurfingSvr' -ErrorAction Stop
+        if ($service.Status -eq 'Stopped') { Start-Service -InputObject $service -ErrorAction Stop }
     }
-    Start-Sleep -Seconds $ClientStartWaitSec
+    $mine = [Diagnostics.Process]::GetCurrentProcess().SessionId
+    $running = @(Get-Process -Name $ClientProc -ErrorAction SilentlyContinue | Where-Object {
+        $_.SessionId -eq $mine -and $_.Path -ieq $ClientExe
+    })
+    if (-not $ForceRestart -and $running.Count -and (Find-ClientWebWindow) -ne [IntPtr]::Zero) { return }
+    foreach ($proc in $running) {
+        $proc | Stop-Process -Force -ErrorAction Stop
+        if (-not $proc.WaitForExit(5000)) { throw '天翼进程尚未退出。' }
+    }
+    Start-Process -FilePath $ClientExe -WorkingDirectory $ClientDir -WindowStyle Normal -ErrorAction Stop
+    $wait = $ClientStartWaitSec
+    if ($script:RecoveryDeadline) { $wait = [Math]::Min($wait,[Math]::Max(0,[int][Math]::Floor(($script:RecoveryDeadline - (Get-Date)).TotalSeconds))) }
+    if ($wait -gt 0) { Start-Sleep -Seconds $wait }
 }
 
-function Wait-AdapterUp {
-    param([int]$TimeoutSec = 45)
-    $deadline = (Get-Date).AddSeconds($TimeoutSec)
-    while ((Get-Date) -lt $deadline) {
-        try {
-            $ad = Get-NetAdapter -Name $AdapterName -ErrorAction Stop
-            if ($ad.Status -eq 'Up') {
-                $ip = Get-NetIPAddress -InterfaceAlias $AdapterName -AddressFamily IPv4 -ErrorAction SilentlyContinue
-                $ready = @($ip | Where-Object { $_.AddressState -eq 'Preferred' -and
-                    $_.IPAddress -notlike '169.254.*' -and $_.IPAddress -notlike '127.*' })
-                if ($ready.Count) { return $true }
-            }
-        } catch {}
+function Wait-AdapterUp([int]$TimeoutSec = 45) {
+    $end = [datetime]::UtcNow.AddSeconds($TimeoutSec)
+    do {
+        $link = Get-PhysicalLink
+        if ($link -eq 'Campus') { return $true }
+        if ($link -eq 'Away') { return $false }
         Start-Sleep -Seconds 2
-    }
+    } while ([datetime]::UtcNow -lt $end)
     return $false
 }
 
 function Repair-NicAdapter {
     Log ('禁用并重新启用网卡: ' + $AdapterName)
     try {
+        $ad = Get-NetAdapter -Name $AdapterName -ErrorAction Stop
+        if ($ad.Status -eq 'Disabled') { return $false }
+        Write-CampusFile (Join-Path $Root 'adapter-recovery.txt') ([string]$ad.InterfaceGuid)
         Disable-NetAdapter -Name $AdapterName -Confirm:$false -ErrorAction Stop
         Start-Sleep -Seconds 4
-        Enable-NetAdapter -Name $AdapterName -Confirm:$false -ErrorAction Stop
     } catch {
         Log ('网卡操作失败: ' + $_.Exception.Message)
         return $false
-    }
+    } finally { [void](Restore-OwnedAdapter) }
     $up = Wait-AdapterUp -TimeoutSec 45
     Log ('网卡恢复状态: ' + $up)
     return $up
 }
 
-function Invoke-CampusRecovery {
-    # One bounded cycle; restore proxies on success, failure, or a terminating error.
-    $authLock = Get-AuthenticationLock
-    if (-not $authLock) {
-        Log '另一联网任务正在认证, 本轮等待, 不重启客户端或网卡'
+function Restore-OwnedAdapter {
+    $file = Join-Path $Root 'adapter-recovery.txt'
+    if (-not [IO.File]::Exists($file)) { return $true }
+    try {
+        $guid = [guid]([IO.File]::ReadAllText($file).Trim())
+        $ad = Get-NetAdapter -IncludeHidden -ErrorAction Stop | Where-Object { $_.InterfaceGuid -and [guid]$_.InterfaceGuid -eq $guid } | Select-Object -First 1
+        if (-not $ad) { return $false }
+        if ($ad.Status -eq 'Disabled' -or $ad.AdminStatus -eq 'Down') {
+            $ad | Enable-NetAdapter -Confirm:$false -ErrorAction Stop
+        }
+        [IO.File]::Delete($file)
+        return $true
+    } catch {
+        Set-CampusStatus 'adapter' '正在恢复先前由看门狗暂停的校园网网卡'
         return $false
     }
+}
+
+function Invoke-CampusRecovery([switch]$RepairProxy,[scriptblock]$BeforeLogin) {
+    $lock = Get-AuthenticationLock
+    if (-not $lock) { return $false }
+    $script:loginTimedOut = $false; $script:accountPending = $false
+    $script:submittedWindow = [intptr]::Zero
     try {
-        if (-not (Wait-AdapterUp -TimeoutSec 45)) {
-            Log '物理网卡尚未就绪, 等待有效 IPv4 后重试, 本轮不重启客户端'
-            return $false
-        }
+        if (-not (Restore-AuthNetworkContext $AutoNetworkStatePath)) { return $false }
+        if (-not (Wait-AdapterUp -TimeoutSec 45)) { return $false }
         if ($Config.proxy_guard) {
             if (Test-Path -LiteralPath $NetworkStatePath) {
-                Update-AuthNetworkContext -StatePath $NetworkStatePath -ClashConfigPath $Config.clash_config_path
-            } else {
-                Enter-AuthNetworkContext -StatePath $NetworkStatePath -ClashConfigPath $Config.clash_config_path
+                Update-AuthNetworkContext $NetworkStatePath $Config.clash_config_path
+            } else { Enter-AuthNetworkContext $NetworkStatePath $Config.clash_config_path -RepairProxy:$RepairProxy }
+        }
+        if (Test-Internet) { return $true }
+        if ($RepairProxy) { return $false }
+        for ($stage = 1; $stage -le 2; $stage++) {
+            if ($stage -eq 2) {
+                if (($script:RecoveryDeadline -and (Get-Date) -ge $script:RecoveryDeadline) -or (Get-PhysicalLink) -ne 'Campus') { return $false }
+                if (Test-Internet) { return $true }
+                if (((Get-Date)-$script:lastBounce).TotalSeconds -le $NicBounceCooldown) { return $false }
+                $script:lastBounce = Get-Date
+                Set-CampusStatus 'adapter' '认证未通过，正在重新连接校园网网卡'
+                if (-not (Repair-NicAdapter)) { return $false }
+                Send-Toast '已重启网卡，正在重新登录'
+                if (Test-Internet) { return $true }
+            }
+            Restart-Client -ForceRestart:($stage -eq 2 -or $script:retryClient)
+            $script:retryClient = $false
+            Update-LoginGuard
+            $result = Invoke-LoginClick -BeforeLogin $BeforeLogin
+            if ($result -eq 'Timeout') {
+                $script:retryClient = $script:lastLoginRead -in @('no-window','no-glyph')
+                if ($script:lastLoginRead -eq 'no-glyph') {
+                    $script:readMisses++
+                    if ($stage -eq 1 -and $script:readMisses -ge 2) { continue }
+                } else { $script:readMisses = 0 }
+                return $false
+            }
+            $script:readMisses=0
+            if ($result -eq 'Online') { return $true }
+            if ($result -ne 'Submitted') { return $false }
+            if (Wait-AuthSettle) {
+                if ($script:submittedWindow -ne [intptr]::Zero -and $script:submittedWindow -in @(Get-CampusWindows)) {
+                    [CampusRecovery.LoginScreen]::Minimize($script:submittedWindow)
+                }
+                return $true
             }
         }
-        if (Test-Internet) { return $true }
-        Restart-Client
-        if ($Config.proxy_guard) {
-            Update-AuthNetworkContext -StatePath $NetworkStatePath -ClashConfigPath $Config.clash_config_path
-        }
-        if (Test-Internet) { return $true }
-        Invoke-LoginClick | Out-Null
-        if (Wait-AuthSettle) { Log '恢复成功 (重启客户端/点击登录, HTTP验证通过)'; return $true }
-        Log '第1级恢复未成功'
-
-        if (((Get-Date) - $script:lastBounce).TotalSeconds -le $NicBounceCooldown) {
-            Log '网卡重启冷却中, 本轮跳过'
-            return $false
-        }
-        $script:lastBounce = Get-Date
-        if (-not (Repair-NicAdapter)) { return $false }
-        Send-Toast '已重启网卡, 正在重新登录...'
-        Restart-Client
-        if ($Config.proxy_guard) {
-            Update-AuthNetworkContext -StatePath $NetworkStatePath -ClashConfigPath $Config.clash_config_path
-        }
-        if (Test-Internet) { return $true }
-        Invoke-LoginClick | Out-Null
-        if (Wait-AuthSettle) { Log '恢复成功 (网卡重启后登录, HTTP验证通过)'; return $true }
-        Log '第2级恢复未成功, 稍后继续重试'
         return $false
     } catch {
-        # Do not include exception text that could contain controller/PAC credentials.
-        Log ('本轮恢复异常, 将恢复代理并重试: ' + $_.Exception.GetType().Name)
+        Log ('恢复中断，准备恢复代理：'+$_.Exception.GetType().Name)
         return $false
     } finally {
-        if (-not (Restore-AuthNetworkContext -StatePath $NetworkStatePath)) {
-            Log '代理恢复尚未完成, 下轮优先重试恢复原设置'
-        }
-        Release-AuthenticationLock $authLock
+        try { [void](Restore-AuthNetworkContext $NetworkStatePath) }
+        finally { Release-AuthenticationLock $lock }
     }
 }
 
@@ -517,7 +557,7 @@ function Invoke-ReconnectSelfTest([string]$Id, [datetime]$Deadline) {
         Enter-AuthNetworkContext -StatePath $NetworkStatePath -ClashConfigPath $Config.clash_config_path
         $report.tun_stopped = -not (Test-ClashTunActive)
         if (-not $report.tun_stopped) { throw 'TUN did not actually stop.' }
-        Restart-Client
+        Restart-Client -ForceRestart
         $h = Find-ClientWebWindow
         if ($h -eq [IntPtr]::Zero) { throw 'Client window is missing.' }
         $dp = Get-DisconnectPoint $h
@@ -588,7 +628,7 @@ function Invoke-CommandFile {
             Invoke-ReconnectSelfTest -Id $testId -Deadline $deadline
         }
         '^restart-client$' {
-            Restart-Client
+            Restart-Client -ForceRestart
             Log 'restart-client: completed'
         }
         '^enable-adapter$' {
@@ -628,7 +668,7 @@ function Invoke-CommandFile {
                 Restore-ClientWindow $h | Out-Null
                 Save-WindowShot $h 'manual'
                 Start-Sleep -Milliseconds 300
-                [CampusWatch.Win32]::ShowWindow($h, 6) | Out-Null
+                [CampusRecovery.LoginScreen]::Minimize($h)
             } else { Log 'shot: 未找到客户端窗口' }
         }
         'status' {
@@ -640,12 +680,26 @@ function Invoke-CommandFile {
     }
 }
 
+Initialize-CampusNative
+$script:LoginGlyph = [Drawing.Bitmap]::new((Join-Path $Root 'ui\login-glyph.png'))
+$script:LoginX = $LoginBtnOffsetX / [double]$CalibWinW
+$script:LoginY = $LoginBtnOffsetY / [double]$CalibWinH
+if ($HasPhysRef) {
+    $script:LoginX = $PhysBtnX / [double]$PhysWinW
+    $script:LoginY = $PhysBtnY / [double]$PhysWinH
+}
+$script:lastBounce = [datetime]::MinValue
+if ($Embedded) { return }
+
 # ---------- 调试模式: 只探活一次 ----------
 if ($Check) {
-    $ad = Get-NetAdapter -Name $AdapterName -ErrorAction SilentlyContinue
+    $ad = [Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() | Where-Object Name -eq $AdapterName | Select-Object -First 1
     $adStatus = '未找到'
-    if ($ad) { $adStatus = $ad.Status }
-    Write-Output ('在线:   ' + (Test-Internet))
+    if ($ad) { $adStatus = $ad.OperationalStatus }
+    Write-Output ('直连外网: ' + (Test-Internet))
+    $lan = Read-LanSettings
+    Write-Output ('Windows 系统代理: ' + [bool]($lan.Flags -band 2) + '  PAC: ' + [bool]($lan.Flags -band 4) + '  TUN: ' + (Test-ClashTunActive))
+    Write-Output ('校园网物理链路: ' + (Get-PhysicalLink) + '  Clash Verge: ' + (Get-VergeExecutable))
     Write-Output '探活:   HTTP 状态码 + 正文校验 (禁用请求代理/重定向/缓存)'
     Write-Output ('代理保护: ' + [bool]$Config.proxy_guard + '  待恢复设置: ' + (Test-Path -LiteralPath $NetworkStatePath))
     Write-Output ('网卡:   ' + $AdapterName + ' -> ' + $adStatus)
@@ -669,9 +723,9 @@ if ($Check) {
     if ($CampusGuard) {
         $curPrefixes = ''
         try {
-            $curPrefixes = ((Get-NetIPAddress -InterfaceAlias $AdapterName -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-                Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } |
-                ForEach-Object { ($_.IPAddress.Split('.')[0..1] -join '.') + '.' }) | Select-Object -Unique) -join ','
+            $curPrefixes = (($ad.GetIPProperties().UnicastAddresses | Where-Object {
+                $_.Address.AddressFamily -eq 'InterNetwork' -and $_.Address -notmatch '^(127\.|169\.254\.)'
+            } | ForEach-Object { ($_.Address.ToString().Split('.')[0..1] -join '.') + '.' }) | Select-Object -Unique) -join ','
         } catch {}
         Write-Output ('离校守卫: 已启用 校园前缀=[' + ($CampusIpPrefixes -join ',') + '] 校园网关=[' +
                       ($CampusGateways -join ',') + '] 当前IP前缀=[' + $curPrefixes + '] 判定在校园网=' + (Test-OnCampus))
@@ -692,80 +746,42 @@ if (-not $ownsMutex) {
 }
 
 # ---------- 主循环 ----------
-Log '===== 校园网看门狗启动 v1.5.0 (Clash Verge / Meta) ====='
-$fails = 0
-$lastBounce = Get-Date '2000-01-01'
-$awayMode = $false
-
+Log '===== 校园网看门狗启动 v1.6.3 ====='
+$script:fails = 0
+$script:nextProxyRepair = [datetime]::MinValue
+$script:verifyAfterWake = $true
 try {
-if ($RestoreNetwork) {
-    if (Restore-AuthNetworkContext -StatePath $NetworkStatePath) { exit 0 }
-    exit 1
-}
-if ($RecoverOnce) {
-    if (-not (Restore-AuthNetworkContext -StatePath $NetworkStatePath)) { exit 1 }
-    if (-not (Test-OnCampus)) { Log '不在校园网, 跳过单次恢复'; exit 2 }
-    if (Test-Internet) { Log 'HTTP验证已在线, 无需恢复'; exit 0 }
-    if ((Invoke-CampusRecovery) -and -not (Test-Path -LiteralPath $NetworkStatePath) -and
-        (Wait-InternetHttp -Targets $HttpProbeTargets -TimeoutMs $ProbeTimeoutMs)) { exit 0 }
-    exit 1
-}
-while ($true) {
-    if (-not (Restore-AuthNetworkContext -StatePath $NetworkStatePath)) {
-        Start-Sleep -Seconds $CheckIntervalSec
-        continue
+    if ($RestoreNetwork) {
+        if ((Restore-AuthNetworkContext $NetworkStatePath) -and (Restore-AuthNetworkContext $AutoNetworkStatePath)) { exit 0 }
+        exit 1
     }
-    Invoke-CommandFile
-
-    if (Test-Internet) {
-        if ($fails -ge $FailThreshold) { Log '网络已恢复, 回到正常监测' }
-        if ($awayMode) { Log '已恢复网络'; $awayMode = $false }
-        $fails = 0
-        Start-Sleep -Seconds $CheckIntervalSec
-        continue
+    if ($RecoverOnce) {
+        $offCampus = $false
+        if (Invoke-SingleConnection -OffCampus ([ref]$offCampus)) { exit 0 }
+        if ($offCampus) { Log '不在校园网，跳过单次恢复'; exit 2 }
+        exit 1
     }
-
-    $fails++
-    if ($fails -lt $FailThreshold) {
-        Start-Sleep -Seconds $CheckIntervalSec
-        continue
-    }
-
-    # ---- 离校静默守卫: 不在校园网(回家/热点/酒店WiFi等)时不执行任何恢复动作 ----
-    if (-not (Test-OnCampus)) {
-        if (-not $awayMode) {
-            $awayMode = $true
-            $ips = ''
-            try {
-                $ips = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-                    Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } |
-                    Select-Object -ExpandProperty IPAddress) -join ','
-            } catch {}
-            Log ('探测失败, 但当前不在校园网环境 (本机IP: ' + $ips + '), 进入静默模式: 不重启客户端/不动网卡, 每 ' +
-                 [int]($AwayCheckIntervalSec / 60) + ' 分钟轻探一次')
+    $trayReady = [CampusRecovery.StatusTray]::Start((Join-Path $Root 'status.txt'))
+    Write-CampusFile (Join-Path $Root 'ready.txt') ('1.6.3|'+$PID+'|'+$trayReady+'|'+[datetime]::UtcNow.Ticks)
+    try { Initialize-CampusAccountChoice } catch { Log '正在等待本次开机的账号选择。' }
+    Set-CampusStatus 'check' '正在识别校园网及代理状态'
+    $wake = $false
+    while ($true) {
+        $signalled = [CampusRecovery.StatusTray]::TakeWake()
+        if ($wake -or $signalled) {
+            $script:verifyAfterWake = $true; $script:fails = 0; $script:nextProxyRepair = [datetime]::MinValue
+            Set-CampusStatus 'wake' '电脑刚刚唤醒，正在检查网卡、校园网和代理'
         }
-        $fails = 0
-        Start-Sleep -Seconds $AwayCheckIntervalSec
-        continue
+        $before = [datetime]::UtcNow
+        try { $delay = Invoke-MonitorPass } catch {
+            Log ('监测异常，将重试：'+$_.Exception.GetType().Name)
+            Set-CampusStatus 'error' '暂时无法识别网络状态，正在重试'
+            $delay = 5
+        }
+        $gap = ([datetime]::UtcNow-$before).TotalMinutes -gt 15
+        $wake = (Wait-MonitorDelay $delay) -or $gap
     }
-    if ($awayMode) { Log '已回到校园网环境, 恢复正常监测'; $awayMode = $false }
-
-    Log '连续探测失败, 判定断网, 开始自动恢复'
-    Send-Toast '检测到断网, 正在自动登录...'
-
-    if ((Invoke-CampusRecovery) -and -not (Test-Path -LiteralPath $NetworkStatePath) -and
-        (Wait-InternetHttp -Targets $HttpProbeTargets -TimeoutMs $ProbeTimeoutMs)) {
-        Log '代理/TUN恢复后HTTP验证通过, 回到正常监测'
-        Send-Toast '校园网已自动恢复上网'
-        $fails = 0
-        Start-Sleep -Seconds $CheckIntervalSec
-        continue
-    }
-    $fails = 1   # 让梯子约40秒后重走
-    Start-Sleep -Seconds $CheckIntervalSec
-}
 } finally {
-    Restore-AuthNetworkContext -StatePath $NetworkStatePath | Out-Null
-    $mutex.ReleaseMutex()
-    $mutex.Dispose()
+    try { [void](Restore-AuthNetworkContext $NetworkStatePath) }
+    finally { $script:LoginGlyph.Dispose(); $mutex.ReleaseMutex(); $mutex.Dispose() }
 }

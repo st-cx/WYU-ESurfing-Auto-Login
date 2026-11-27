@@ -15,9 +15,8 @@ public sealed class CampusVergePipeFixture : IDisposable {
     readonly Thread worker;
     volatile bool stopped;
     bool tun = true;
-    public CampusVergePipeFixture(string name) {
-        server = new NamedPipeServerStream(name, PipeDirection.InOut, 1,
-            PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+    public CampusVergePipeFixture(NamedPipeServerStream stream) {
+        server = stream;
         worker = new Thread(Run); worker.IsBackground = true; worker.Start();
     }
     void Run() {
@@ -54,6 +53,7 @@ public sealed class CampusVergePipeFixture : IDisposable {
                     server.Write(header, 0, header.Length);
                     if (bytes.Length > 0) server.Write(bytes, 0, bytes.Length);
                     server.Flush();
+                    server.WaitForPipeDrain();
                 }
             } catch { if (stopped) return; }
             finally { try { if (server.IsConnected) server.Disconnect(); } catch {} }
@@ -63,6 +63,16 @@ public sealed class CampusVergePipeFixture : IDisposable {
 }
 '@
 
+function New-FixturePipe([string]$Name) {
+    # The random test-only stub contains no user configuration. Restricted test tokens can read and write it.
+    $rights = [IO.Pipes.PipeSecurity]::new()
+    $rights.AddAccessRule([IO.Pipes.PipeAccessRule]::new([Security.Principal.WindowsIdentity]::GetCurrent().User,'FullControl','Allow'))
+    $rights.AddAccessRule([IO.Pipes.PipeAccessRule]::new([Security.Principal.SecurityIdentifier]::new('S-1-1-0'),'ReadWrite','Allow'))
+    if ($PSVersionTable.PSEdition -eq 'Core') {
+        $server = [IO.Pipes.NamedPipeServerStreamAcl]::Create($Name,'InOut',1,'Byte','Asynchronous',4096,4096,$rights)
+    } else { $server = [IO.Pipes.NamedPipeServerStream]::new($Name,'InOut',1,'Byte','Asynchronous',4096,4096,$rights) }
+    return [CampusVergePipeFixture]::new($server)
+}
 function Assert-True([bool]$Condition, [string]$Message) { if (-not $Condition) { throw $Message } }
 $temporary = Join-Path ([IO.Path]::GetTempPath()) ('campus-verge-test-' + [guid]::NewGuid().ToString('N'))
 $oldAppData = $env:APPDATA; $oldProfile = $env:USERPROFILE
@@ -77,7 +87,7 @@ try {
     $id = [guid]::NewGuid().ToString('N')
     $serviceName = 'verge-mihomo-production-' + $id
     $sidecarName = 'verge-mihomo-sidecar-release-' + $id
-    $service = New-Object CampusVergePipeFixture($serviceName)
+    $service = New-FixturePipe $serviceName
     $runtime = Join-Path $vergeDir 'clash-verge.yaml'
     Set-Content -LiteralPath $runtime -Value @(
         "external-controller: ''", ('external-controller-pipe: \\.\pipe\' + $sidecarName), 'secret: fixture-only')
@@ -92,7 +102,7 @@ try {
     Write-Output 'PASS: Pipe transport authenticates GET and PATCH with HTTP responses.'
 
     $service.Dispose(); $service = $null
-    $sidecar = New-Object CampusVergePipeFixture($sidecarName)
+    $sidecar = New-FixturePipe $sidecarName
     $controller = Get-LocalClashController -ConfigPath $runtime
     Assert-True ($controller -and $controller.pipe_name -eq $sidecarName) 'Ordinary sidecar mode must use its configured local pipe.'
     Write-Output 'PASS: The same config works in ordinary sidecar mode.'
