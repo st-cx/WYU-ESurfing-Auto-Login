@@ -5,7 +5,7 @@ $package = $PSScriptRoot
 $target = Get-InstallDir (Get-ConsoleUser)
 $auto = Get-CompanionPath $target
 $taskName = 'CampusNetWatchdog'
-$version = '1.6.3'
+$version = '1.7.0'
 $files = Get-CampusProgramFiles
 $report = [pscustomobject]@{Stage='检查更新包'; LogFile=$null; Warning=''; Rollback=''; Backup=''}
 
@@ -57,17 +57,12 @@ function Invoke-CampusUpdate($Task,[string]$Package,[string]$Target,[string]$Aut
     $journal = Join-Path $Target 'proxy-recovery.json'
     $otherJournal = Join-Path (Split-Path -Parent $Auto) 'proxy-recovery.json'
     $stopped = $false; $replaced = [Collections.Generic.List[string]]::new()
-    $changedTask = $false; $changedAuto = $false
+    $changedTask = $false
     $missingDirs = @('ui','tools' | ForEach-Object { Join-Path $Target $_ } | Where-Object { -not [IO.Directory]::Exists($_) })
     try {
         $Task = Get-CampusTask $Task.TaskName $watch
         if (-not $Task -or -not [IO.File]::Exists($watch)) { throw '没有找到现有安装。请解压完整 ZIP 并运行一键安装。' }
         Set-UpdateStage $Report '备份现有脚本及计划任务'
-        $edit = Get-CompanionEdit $Auto
-        if ($edit.Warning) {
-            $Report.Warning = $edit.Warning
-            Write-UpdateLog $Report $edit.Warning
-        }
         [void][IO.Directory]::CreateDirectory($backup)
         $Report.Backup = $backup
         $oldXml = Export-ScheduledTask -TaskName $Task.TaskName -TaskPath $Task.TaskPath -ErrorAction Stop
@@ -80,7 +75,6 @@ function Invoke-CampusUpdate($Task,[string]$Package,[string]$Target,[string]$Aut
                 [IO.File]::Copy($old,$backupFile)
             }
         }
-        if ($edit.Updated) { [IO.File]::Copy($Auto,(Join-Path $backup 'campus-auth.ps1')) }
         Set-UpdateStage $Report '停止旧版看门狗'
         Stop-ScheduledTask -TaskName $Task.TaskName -TaskPath $Task.TaskPath -ErrorAction Stop
         $stopped = $true
@@ -89,16 +83,13 @@ function Invoke-CampusUpdate($Task,[string]$Package,[string]$Target,[string]$Aut
             if ([datetime]::UtcNow -ge $stopUntil) { throw '原看门狗仍在退出。' }
             Start-Sleep -Milliseconds 350
         }
-        if (-not (Restore-AuthNetworkContext $journal) -or -not (Restore-AuthNetworkContext $otherJournal)) { throw '代理设置仍在恢复。' }
-        Set-UpdateStage $Report '安装新版文件及开机认证入口'
+        foreach ($pending in @($journal,$otherJournal)) {
+            if ([IO.File]::Exists($pending) -and -not (Restore-AuthNetworkContext $pending)) { throw '上次认证留下的代理设置仍在恢复。' }
+        }
+        Set-UpdateStage $Report '安装新版程序文件'
         foreach ($name in $Files) {
             Write-BytesAtomically (Join-Path $Target $name) ([IO.File]::ReadAllBytes((Join-Path $Package $name)))
             $replaced.Add($name)
-        }
-        if ($edit.Updated) {
-            if ((Read-CompanionScript $Auto) -cne $edit.Original) { throw '开机认证入口在更新过程中被修改。请重试。' }
-            Write-CompanionScript $Auto $edit.Updated
-            $changedAuto = $true
         }
         Set-UpdateStage $Report '设置附加唤醒触发器'
         try { $changedTask = Add-WakeTrigger $Task }
@@ -119,20 +110,6 @@ function Invoke-CampusUpdate($Task,[string]$Package,[string]$Target,[string]$Aut
             $issues = [Collections.Generic.List[string]]::new()
             try { Stop-ScheduledTask -TaskName $Task.TaskName -TaskPath $Task.TaskPath -ErrorAction Stop }
             catch { $issues.Add('停止更新实例：'+$_.Exception.Message) }
-            if ($changedAuto) {
-                try {
-                    if ([IO.File]::Exists($Auto)) {
-                        $now = Read-CompanionScript $Auto
-                        if ($now -ceq $edit.Updated) {
-                            Write-BytesAtomically $Auto ([IO.File]::ReadAllBytes((Join-Path $backup 'campus-auth.ps1')))
-                        } else {
-                            $restored = Remove-CompanionHooks $now -KeepLogin:($edit.Original.Contains('# CampusNet shared login v1.6')) -KeepAccount:($edit.Original.Contains('# CampusNet verified account v1.6.2'))
-                            if ($restored -cne $now) { Write-CompanionScript $Auto $restored }
-                        }
-                    }
-                }
-                catch { $issues.Add('还原开机认证入口：'+$_.Exception.Message) }
-            }
             foreach ($name in $replaced) {
                 try {
                     $bak = Join-Path $backup $name; $dst = Join-Path $Target $name
@@ -178,10 +155,7 @@ try {
     }
     Initialize-CampusNative
     if ($Preview) {
-        $edit = Get-CompanionEdit $auto
-        $msg = '更新预检通过。安装目录：'+$target
-        if ($edit.Warning) { Save-UpdateResult 'WARN' ($msg+[Environment]::NewLine+$edit.Warning) }
-        else { Save-UpdateResult 'OK' $msg }
+        Save-UpdateResult 'OK' ('更新预检通过。安装目录：'+$target)
         return
     }
     Set-UpdateStage $report '读取已安装的 Windows 计划任务'
@@ -189,7 +163,7 @@ try {
         [Security.Principal.WindowsBuiltInRole]::Administrator)) { throw '更新现有计划任务需要 Windows 管理员权限。' }
     $task = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
     Invoke-CampusUpdate $task $package $target $auto $files $version $report
-    $msg = '校园网自动登录 v'+$version+' 已启动，右下角托盘已就绪。'
+    $msg = '校园网自动登录 v'+$version+' 已启动。右键托盘图标可添加账号或设置代理联动。'
     $state = 'OK'
     if ($report.Warning) { $state='WARN'; $msg += [Environment]::NewLine+$report.Warning }
     Write-UpdateLog $report $msg

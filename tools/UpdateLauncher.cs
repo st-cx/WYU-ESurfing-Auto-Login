@@ -10,11 +10,11 @@ using System.Windows.Forms;
 
 [assembly: AssemblyTitle("校园网自动登录更新")]
 [assembly: AssemblyProduct("WYU ESurfing Auto Login")]
-[assembly: AssemblyVersion("1.6.3.0")]
-[assembly: AssemblyFileVersion("1.6.3.0")]
+[assembly: AssemblyVersion("1.7.0.0")]
+[assembly: AssemblyFileVersion("1.7.0.0")]
 
 internal static class UpdateLauncher {
-    const string Title="校园网自动登录 v1.6.3";
+    const string Title="五邑大学校园网 · v1.7.0 更新";
 
     [STAThread] static int Main(string[] args) {
         bool preview=args.Length==1 && args[0]=="--check";

@@ -110,7 +110,8 @@ try {
     Write-Output 'PASS: an uncontrollable active TUN aborts authentication and preserves restoration.'
 
     . (Join-Path $RepoRoot 'monitor.ps1')
-    $Config=@{proxy_guard=$true;clash_config_path=(Join-Path $testDir 'portable.yaml')}
+    $Config=@{clash_config_path=(Join-Path $testDir 'portable.yaml')}
+    $script:CampusPreferences=[pscustomobject]@{ProxyEnabled=$true;DefaultAccount=''}
     function Get-VergeExecutable { return 'fixture\clash-verge.exe' }
     function Get-VergeGui { return $null }
     function Read-VergePreferences { return [pscustomobject]@{runtime=(Join-Path $testDir 'default.yaml');port=7897;proxy=$true;tun=$true} }

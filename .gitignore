@@ -14,6 +14,8 @@ backups/
 accounts.json
 default-account.txt
 alternate-credential.xml
+campus-settings.json
+campus-settings.json.*.tmp
 account-session.txt
 account-prompt-open.txt
 update-result.txt

@@ -24,4 +24,25 @@ try {
         } finally { $card.Dispose() }
     }
     Write-Output 'PASS: complete multiline status and accessible overflow at 100%, 125%, 150%, and 200%.'
+    $calls = [Collections.Generic.List[bool]]::new()
+    $handler = [Action[bool]]{ param($add) $calls.Add($add) }
+    $menuFactory = [CampusRecovery.StatusTray].GetMethod('MakeSettingsMenu',[Reflection.BindingFlags]'Static,NonPublic')
+    $menu = $menuFactory.Invoke($null,[object[]]@($handler))
+    try {
+        if ($menu.Items.Count -ne 2 -or $menu.Items[0].Text -cne '添加账号…' -or $menu.Items[1].Text -cne '账号与设置…') { throw 'Tray account commands are missing.' }
+        $menu.Items[0].PerformClick()
+        $menu.Items[1].PerformClick()
+        if ($calls.Count -ne 2 -or -not $calls[0] -or $calls[1]) { throw 'Tray commands selected the wrong settings mode.' }
+    } finally { $menu.Dispose() }
+    $makeCommand = [CampusRecovery.StatusTray].GetMethod('SettingsStartInfo',[Reflection.BindingFlags]'Static,NonPublic')
+    $path = Join-Path ([IO.Path]::GetTempPath()) '校园网 & tray (test)!\status.txt'
+    $script = Join-Path (Split-Path -Parent $path) 'tools\settings.ps1'
+    foreach ($add in $false,$true) {
+        $command = $makeCommand.Invoke($null,[object[]]@([string]$path,[bool]$add))
+        $end = '-File "'+$script+'"' + $(if ($add) { ' -AddAccount' } else { '' })
+        if ($command.UseShellExecute -or -not $command.CreateNoWindow -or -not $command.Arguments.EndsWith($end,[StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Tray does not start the intended settings script directly.'
+        }
+    }
+    Write-Output 'PASS: right-click settings commands and fixed-script arguments.'
 } finally { $scope.Dispose() }

@@ -20,7 +20,6 @@
     "client_start_wait_sec": 12,
     "login_ready_timeout_sec": 100,
     "auth_settle_wait_sec": 75,
-    "proxy_guard": true,
     "clash_config_path": "",
     "http_probe_targets": [
         {"url": "http://connect.rom.miui.com/generate_204", "status": 204, "body": ""},

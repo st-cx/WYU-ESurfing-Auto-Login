@@ -9,7 +9,8 @@ foreach ($name in @('Invoke-CampusRecovery', 'Test-OnCampus', 'Wait-AdapterUp'))
     }, $true)
     . ([scriptblock]::Create($definition.Extent.Text))
 }
-$Config = @{ proxy_guard = $true; clash_config_path = '' }
+$Config = @{ clash_config_path = '' }
+function Update-CampusPreferences { $script:CampusPreferences=[pscustomobject]@{ProxyEnabled=$true;DefaultAccount=''}; return $true }
 $NetworkStatePath = 'unused-test-state'
 $NicBounceCooldown = 180
 $script:lastBounce = Get-Date '2000-01-01'

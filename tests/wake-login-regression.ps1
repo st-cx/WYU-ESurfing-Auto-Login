@@ -28,6 +28,8 @@ foreach ($name in 'Invoke-LoginClick','Test-SameLoginSample') {
 }
 function Set-CampusStatus {}
 function Update-LoginGuard {}
+function Update-CampusPreferences {return $true}
+function Confirm-CampusAccount {return $true}
 function Start-Sleep {}
 function Test-Internet {return $script:online}
 function Get-LoginSample {
@@ -62,3 +64,26 @@ try {
     }
 } finally {$g.Dispose();$frame.Dispose();$glyph.Dispose()}
 Write-Output 'PASS: the glyph matcher rejects blank/loading frames and accepts the login at 100%, 125%, and 150%.'
+
+$form=[Drawing.Bitmap]::new(533,914)
+$button=[Drawing.Point]::new(267,533)
+$digits='0123456789'
+$font=[Drawing.Font]::new('Segoe UI',23,[Drawing.FontStyle]::Regular,[Drawing.GraphicsUnit]::Pixel)
+$g=[Drawing.Graphics]::FromImage($form)
+try {
+    $g.Clear([Drawing.Color]::White)
+    $g.TextRenderingHint=[Drawing.Text.TextRenderingHint]::AntiAliasGridFit
+    for($i=0;$i -lt 7;$i++){ $g.FillEllipse([Drawing.Brushes]::Black,106+12*$i,377,8,8) }
+    Assert (-not [CampusRecovery.LoginScreen]::FormReady($form,$button,'')) 'Password dots without an account were accepted.'
+    for($i=0;$i -lt $digits.Length;$i++){
+        $g.DrawString([string]$digits[$i],$font,[Drawing.Brushes]::Black,[single](106+19*$i),[single]303,[Drawing.StringFormat]::GenericTypographic)
+    }
+    Assert ([CampusRecovery.LoginScreen]::FormReady($form,$button,'')) 'A remembered numeric user and a real masked field were rejected.'
+    Assert ([CampusRecovery.LoginScreen]::FormReady($form,$button,$digits)) 'The matching selected user was rejected.'
+    Assert (-not [CampusRecovery.LoginScreen]::FormReady($form,$button,'0123456780')) 'A different selected user was accepted.'
+    $g.FillRectangle([Drawing.Brushes]::White,85,360,350,50)
+    Assert (-not [CampusRecovery.LoginScreen]::FormReady($form,$button,'')) 'A remembered account with an empty password was accepted.'
+    $g.DrawString('请输入密码',$font,[Drawing.Brushes]::Gray,105,365)
+    Assert (-not [CampusRecovery.LoginScreen]::FormReady($form,$button,'')) 'Password placeholder text was accepted as a saved credential.'
+} finally {$g.Dispose();$font.Dispose();$form.Dispose()}
+Write-Output 'PASS: synthetic Tianyi forms require a numeric user and actual password masks; blank fields, placeholder text and mismatched users are rejected.'
